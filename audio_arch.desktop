@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Audio Arch
+Comment=Use Android device as an ultra-low latency external sound card
+Exec=/home/kenway/Projects/Audio\ Arch/audio_arch.sh
+Terminal=true
+Type=Application
+Icon=audio-card
+Categories=AudioVideo;Audio;
+

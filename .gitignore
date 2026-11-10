@@ -1,0 +1,30 @@
+# Build artifacts and compiled outputs
+build/
+*.class
+*.jar
+*.o
+*.so
+audioarch_daemon
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and log files
+*.log
+*.raw
+*.pcm
+*.tmp
+*.swp
+*~
+
+# Local caches
+.cache/
+
+# OS and Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
