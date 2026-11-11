@@ -34,7 +34,7 @@ public class AudioReceiver {
         System.out.printf("[Daemon] AudioTrack buffer size: %d bytes (%.1f ms)%n",
             trackBufSize, (trackBufSize * 1000.0) / (sampleRate * 4));
 
-        final AudioTrack track = new AudioTrack(
+        AudioTrack track = new AudioTrack(
             AudioManager.STREAM_MUSIC,
             sampleRate,
             channelConfig,
@@ -48,13 +48,14 @@ public class AudioReceiver {
             System.exit(1);
         }
 
+        final AudioTrack hookTrack = track;
         Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
             @Override
             public void run() {
                 running = false;
                 try {
-                    track.stop();
-                    track.release();
+                    hookTrack.stop();
+                    hookTrack.release();
                 } catch (Exception ignored) {}
                 System.out.println("[Daemon] Shutdown complete.");
             }
@@ -88,8 +89,12 @@ public class AudioReceiver {
                         in.skip(initAvail);
                     }
 
-                    track.flush();
-                    track.play();
+                    try {
+                        track.flush();
+                        track.play();
+                    } catch (Exception e) {
+                        System.out.println("[Daemon] AudioTrack play warning: " + e.getMessage());
+                    }
 
                     int read;
                     while (running && (read = in.read(chunk)) != -1) {
@@ -109,7 +114,19 @@ public class AudioReceiver {
                         int written = 0;
                         while (written < read) {
                             int ret = track.write(chunk, written, read - written);
-                            if (ret <= 0) break;
+                            if (ret < 0) {
+                                System.err.println("[Daemon] AudioTrack write error " + ret + ", re-initializing...");
+                                try {
+                                    track.stop();
+                                    track.release();
+                                } catch (Exception ignored) {}
+                                try {
+                                    track = new AudioTrack(AudioManager.STREAM_MUSIC, sampleRate, channelConfig, audioFormat, trackBufSize, AudioTrack.MODE_STREAM);
+                                    track.play();
+                                } catch (Exception ignored) {}
+                                break;
+                            }
+                            if (ret == 0) break;
                             written += ret;
                         }
                     }
@@ -121,9 +138,9 @@ public class AudioReceiver {
                     } catch (Exception ignored) {}
 
                     try { client.close(); } catch (Exception ignored) {}
-                } catch (IOException e) {
+                } catch (Exception e) {
                     if (running) {
-                        System.out.println("[Daemon] Connection reset: " + e.getMessage());
+                        System.out.println("[Daemon] Connection reset/exception: " + e.getMessage());
                     }
                 }
             }
