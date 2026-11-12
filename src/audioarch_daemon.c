@@ -17,6 +17,8 @@
 #include <netinet/tcp.h>
 #include <tinyalsa/asoundlib.h>
 
+#define DAEMON_VERSION "1.2.0"
+
 static volatile int running = 1;
 
 static void sig_handler(int sig) {
@@ -57,6 +59,11 @@ static void configure_mixer(int card) {
 }
 
 int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+        printf("AudioArch Native ALSA Daemon v%s\n", DAEMON_VERSION);
+        return 0;
+    }
+
     int port = 12345;
     int rate = 44100;
     int card = 0;
@@ -73,8 +80,8 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("[Daemon] Starting Native C AudioArch Daemon on port %d (rate=%dHz, card=%d, device=%d)\n",
-           port, rate, card, device);
+    printf("[Daemon] AudioArch Native ALSA Daemon v%s starting on port %d (rate=%dHz, card=%d, device=%d)\n",
+           DAEMON_VERSION, port, rate, card, device);
 
     configure_mixer(card);
 

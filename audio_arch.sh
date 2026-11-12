@@ -22,6 +22,10 @@ SRC_DIR="${SCRIPT_DIR}/src"
 MODE="auto" # "auto", "bt", or "alsa"
 ACTIVE_BACKEND="alsa"
 BT_DEVICE_NAME=""
+DAEMON_VERSION="1.2.0"
+REMOTE_VER_FILE="/data/local/tmp/audioarch_version"
+FORCE_DEPLOY=false
+FORCE_RESTART=false
 
 # Native C Daemon (Card 0 DAC)
 C_BIN="audioarch_daemon"
@@ -40,6 +44,7 @@ PORT=12345
 SAMPLE_RATE=44100
 CHANNELS=2
 LATENCY_MS=15
+CLI_LATENCY_SET=false
 SINK_NAME="AudioArch-Sink"
 SINK_DESC="Android Phone Audio Card"
 
@@ -78,9 +83,11 @@ Auto-routes to Bluetooth earphones/headset if connected, or direct ALSA DAC.
 Options:
     --bt, --bluetooth Force routing to Bluetooth earphones (via AudioTrack)
     --alsa, --c       Force routing to phone 3.5mm jack/speaker (via Native C ALSA)
-    --status          Check link state and Android daemon status
+    --status          Check link state, version info, and Android daemon status
     --test            Send a test audio chime to verify sound on the phone
     --build           Force re-compilation of receiver daemons
+    --restart         Force restart the audio daemon on the phone
+    --force-deploy    Force re-deploying daemon files to the phone
     --kill-daemon     Stop all audio daemons on the phone and exit
     --port PORT       TCP port for ADB forward (default: 12345)
     --rate RATE       Audio sample rate in Hz (default: 44100)
@@ -116,6 +123,14 @@ while [[ $# -gt 0 ]]; do
             ACTION="build"
             shift
             ;;
+        --restart)
+            FORCE_RESTART=true
+            shift
+            ;;
+        --force-deploy)
+            FORCE_DEPLOY=true
+            shift
+            ;;
         --kill-daemon)
             ACTION="kill-daemon"
             shift
@@ -130,6 +145,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --latency)
             LATENCY_MS="$2"
+            CLI_LATENCY_SET=true
             shift 2
             ;;
         -h|--help)
@@ -177,6 +193,16 @@ check_device() {
     info "Connected device: ${model:-Unknown} (Android ${android_ver:-Unknown})"
 
     BT_DEVICE_NAME=$(adb shell dumpsys audio 2>/dev/null | awk -F'=' '/mBluetoothName=/{print $2}' | tr -d '\r\n')
+
+    # Read latency configured in Launcher app settings (if not explicitly overridden on CLI)
+    if [[ "$CLI_LATENCY_SET" == "false" ]]; then
+        local phone_latency
+        phone_latency=$(adb shell "cat /data/local/tmp/audioarch_latency 2>/dev/null" | tr -d '\r\n[:space:]')
+        if [[ -n "$phone_latency" && "$phone_latency" =~ ^[0-9]+$ ]]; then
+            LATENCY_MS="$phone_latency"
+            ok "Audio latency loaded from Launcher app settings: ${CYAN}${LATENCY_MS} ms${NC}"
+        fi
+    fi
 
     if [[ "$MODE" == "bt" ]]; then
         ACTIVE_BACKEND="bt"
@@ -273,47 +299,145 @@ build_all() {
 }
 
 # ------------------------------------------------------------------------------
-# 4. Deploy Daemons to Phone
+# 4. Version & Daemon Detection Helpers
+# ------------------------------------------------------------------------------
+get_remote_version() {
+    adb shell "cat ${REMOTE_VER_FILE} 2>/dev/null" | tr -d '\r\n[:space:]'
+}
+
+get_running_daemon_info() {
+    # Returns "<mode> <pid>" where mode is "bt" or "alsa", or "none" if not running.
+    # Strictly excludes com.audioarch.launcher!
+    local daemon_line
+    daemon_line=$(adb shell ps 2>/dev/null | grep -v "com.audioarch.launcher" | grep -E "audioarch_|audioarch_daemon|AudioReceiver" | head -n 1 || true)
+    if [[ -z "$daemon_line" ]]; then
+        echo "none"
+        return
+    fi
+
+    local pid
+    pid=$(echo "$daemon_line" | awk '{print $2}')
+    local cmdline
+    cmdline=$(adb shell "cat /proc/$pid/cmdline 2>/dev/null" | tr '\0' ' ')
+
+    if [[ "$cmdline" =~ AudioReceiver|audioarch_bt_daemon ]]; then
+        echo "bt $pid"
+    elif [[ "$cmdline" =~ audioarch_daemon ]]; then
+        echo "alsa $pid"
+    elif [[ "$daemon_line" =~ audioarch_daemon ]]; then
+        echo "alsa $pid"
+    elif [[ "$daemon_line" =~ audioarch_|AudioReceiver ]]; then
+        echo "bt $pid"
+    else
+        echo "none"
+    fi
+}
+
+is_daemon_running() {
+    local info
+    info=$(get_running_daemon_info)
+    local mode
+    mode=$(echo "$info" | awk '{print $1}')
+    [[ "$mode" == "$ACTIVE_BACKEND" ]]
+}
+
+# ------------------------------------------------------------------------------
+# 5. Smart Deployment (Skips if already deployed & matches DAEMON_VERSION)
 # ------------------------------------------------------------------------------
 deploy_receiver() {
-    stop_daemon
+    local target_remote_file
+    local target_local_file
+    local daemon_name
+
+    if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
+        target_remote_file="${REMOTE_BT_JAR}"
+        target_local_file="${LOCAL_BT_JAR}"
+        daemon_name="${BT_JAR}"
+    else
+        target_remote_file="${REMOTE_C_BIN}"
+        target_local_file="${LOCAL_C_BIN}"
+        daemon_name="${C_BIN}"
+    fi
+
+    local remote_ver
+    remote_ver=$(get_remote_version)
+
+    # Check if target remote file exists on the phone
+    local remote_exists=false
+    if adb shell "[ -f ${target_remote_file} ]" &>/dev/null; then
+        remote_exists=true
+    fi
+
+    if [[ "$FORCE_DEPLOY" == "false" && "$remote_exists" == "true" && "$remote_ver" == "$DAEMON_VERSION" ]]; then
+        ok "Daemon '${daemon_name}' is already up-to-date (v${DAEMON_VERSION}) on phone. Skipping deployment."
+        return 0
+    fi
+
+    # Deployment required
+    if [[ "$remote_exists" == "true" && -n "$remote_ver" && "$remote_ver" != "$DAEMON_VERSION" ]]; then
+        info "Updating daemon on phone from v${remote_ver:-unknown} -> v${DAEMON_VERSION}..."
+    else
+        info "Deploying daemon '${daemon_name}' (v${DAEMON_VERSION}) to phone..."
+    fi
+
+    # If daemon is running, stop it before updating binary/jar
+    local running_info
+    running_info=$(get_running_daemon_info)
+    if [[ "$running_info" != "none" ]]; then
+        stop_daemon
+    fi
 
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         if [[ ! -f "${LOCAL_BT_JAR}" ]]; then
             build_bt_daemon
         fi
         adb shell "mkdir -p ${REMOTE_CACHE}"
-        info "Deploying Bluetooth receiver (${BT_JAR}) to phone..."
         adb push "${LOCAL_BT_JAR}" "${REMOTE_BT_JAR}" >/dev/null
-        ok "Bluetooth receiver deployed."
+        adb shell "echo '${DAEMON_VERSION}' > ${REMOTE_VER_FILE}"
+        ok "Bluetooth receiver deployed (v${DAEMON_VERSION})."
     else
         if [[ ! -f "${LOCAL_C_BIN}" ]]; then
             build_c_daemon
         fi
-        info "Deploying Native C daemon (${C_BIN}) to phone..."
         adb push "${LOCAL_C_BIN}" "${REMOTE_C_BIN}" >/dev/null
-        adb shell "su -c 'chmod 755 ${REMOTE_C_BIN}'" 2>/dev/null || adb shell "chmod 755 ${REMOTE_C_BIN}" 2>/dev/null || true
-        ok "Native C daemon deployed."
+        adb shell "su -c 'chmod 755 ${REMOTE_C_BIN}' 2>/dev/null || chmod 755 ${REMOTE_C_BIN} 2>/dev/null || true"
+        adb shell "echo '${DAEMON_VERSION}' > ${REMOTE_VER_FILE}"
+        ok "Native C daemon deployed (v${DAEMON_VERSION})."
     fi
 }
 
 # ------------------------------------------------------------------------------
-# 5. Daemon Management on Phone
+# 6. Daemon Lifecycle Management (Preserves active running daemons)
 # ------------------------------------------------------------------------------
-is_daemon_running() {
-    if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
-        adb shell ps 2>/dev/null | grep -E -q "audioarch_|AudioReceiver"
-    else
-        adb shell ps 2>/dev/null | grep -q "${C_BIN}"
-    fi
-}
+ensure_daemon_running() {
+    local running_info
+    running_info=$(get_running_daemon_info)
+    local running_backend
+    running_backend=$(echo "$running_info" | awk '{print $1}')
+    local running_pid
+    running_pid=$(echo "$running_info" | awk '{print $2}')
 
-start_daemon() {
-    if is_daemon_running; then
-        ok "Active audio daemon is already running on the phone."
+    if [[ "$FORCE_RESTART" == "true" ]]; then
+        info "Force restart requested. Stopping active daemon..."
+        stop_daemon
+        start_daemon
         return 0
     fi
 
+    if [[ "$running_backend" == "$ACTIVE_BACKEND" ]]; then
+        ok "Audio daemon (PID ${running_pid}) is already active in ${CYAN}${ACTIVE_BACKEND}${NC} mode. Reusing running daemon."
+        return 0
+    fi
+
+    if [[ "$running_backend" != "none" ]]; then
+        info "Daemon is active in '${running_backend}' mode, but '${ACTIVE_BACKEND}' mode is required. Switching..."
+        stop_daemon
+    fi
+
+    start_daemon
+}
+
+start_daemon() {
     adb shell "svc power stayon usb" &>/dev/null || true
 
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
@@ -325,7 +449,9 @@ start_daemon() {
             adb shell "cat ${REMOTE_BT_LOG}" 2>/dev/null || true
             exit 1
         fi
-        ok "Bluetooth AudioReceiver started successfully (routing to ${BT_DEVICE_NAME:-Bluetooth Earphones})."
+        local new_pid
+        new_pid=$(get_running_daemon_info | awk '{print $2}')
+        ok "Bluetooth AudioReceiver started successfully (PID: ${new_pid:-active}, routing to ${BT_DEVICE_NAME:-Bluetooth Earphones})."
     else
         info "Starting Native C ALSA daemon on phone..."
         adb shell "su -c 'nohup ${REMOTE_C_BIN} ${PORT} ${SAMPLE_RATE} 0 0 > ${REMOTE_C_LOG} 2>&1 &'" 2>/dev/null || \
@@ -336,22 +462,35 @@ start_daemon() {
             adb shell "cat ${REMOTE_C_LOG}" 2>/dev/null || true
             exit 1
         fi
-        ok "Native C ALSA daemon started successfully (routing to 3.5mm jack / speaker)."
+        local new_pid
+        new_pid=$(get_running_daemon_info | awk '{print $2}')
+        ok "Native C ALSA daemon started successfully (PID: ${new_pid:-active}, routing to 3.5mm jack / speaker)."
     fi
 }
 
 stop_daemon() {
-    info "Stopping any running AudioArch daemons on phone..."
-    adb shell "su -c 'pkill -9 -f audioarch || true'" 2>/dev/null || \
-    adb shell "pkill -9 -f audioarch || true" 2>/dev/null || true
+    info "Stopping AudioArch daemon on phone..."
+    local pids
+    pids=$(adb shell ps 2>/dev/null | grep -v "com.audioarch.launcher" | grep -E "audioarch_|audioarch_daemon|AudioReceiver" | awk '{print $2}' || true)
+    if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+            adb shell "kill -9 $pid 2>/dev/null" || true
+        done
+        ok "Audio daemon stopped."
+    else
+        ok "No audio daemon was running."
+    fi
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
-    ok "Daemons stopped."
 }
 
 check_status() {
     check_device
     echo ""
-    info "Active Mode: ${CYAN}${ACTIVE_BACKEND}${NC}"
+    info "Host Script Version: ${GREEN}v${DAEMON_VERSION}${NC}"
+    local remote_ver
+    remote_ver=$(get_remote_version)
+    info "Phone Daemon Version: ${GREEN}${remote_ver:-None recorded}${NC}"
+    info "Target Active Mode: ${CYAN}${ACTIVE_BACKEND}${NC}"
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         info "Bluetooth Device: ${GREEN}${BT_DEVICE_NAME:-None}${NC}"
     fi
@@ -360,11 +499,17 @@ check_status() {
     adb forward --list | grep "${PORT}" || echo "  No forward active on port ${PORT}"
     echo ""
     info "Daemon process status:"
-    if is_daemon_running; then
-        ok "Audio daemon is RUNNING on phone."
+    local running_info
+    running_info=$(get_running_daemon_info)
+    if [[ "$running_info" != "none" ]]; then
+        local r_backend
+        r_backend=$(echo "$running_info" | awk '{print $1}')
+        local r_pid
+        r_pid=$(echo "$running_info" | awk '{print $2}')
+        ok "Audio daemon is RUNNING on phone (PID: ${r_pid}, Mode: ${CYAN}${r_backend}${NC})."
         echo ""
         info "Recent logs:"
-        if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
+        if [[ "$r_backend" == "bt" ]]; then
             adb shell "cat ${REMOTE_BT_LOG} 2>/dev/null" || echo "  No logs found."
         else
             adb shell "cat ${REMOTE_C_LOG} 2>/dev/null" || echo "  No logs found."
@@ -377,7 +522,7 @@ check_status() {
 play_test_tone() {
     check_device
     deploy_receiver
-    start_daemon
+    ensure_daemon_running
 
     info "Forwarding USB port ${PORT}..."
     adb forward "tcp:${PORT}" "tcp:${PORT}"
@@ -461,16 +606,15 @@ esac
 
 check_device
 deploy_receiver
-start_daemon
+ensure_daemon_running
 
 info "Mapping USB TCP port ${PORT} -> phone:${PORT}..."
 adb forward "tcp:${PORT}" "tcp:${PORT}"
 ok "Port mapped."
 
-# Handshake test
-if ! nc -z 127.0.0.1 "${PORT}" 2>/dev/null; then
-    warn "Port handshake failed. Restarting daemon..."
-    stop_daemon
+# Verify receiver listener socket
+if ! adb shell "netstat -an 2>/dev/null | grep -E '12345.*LISTEN'" &>/dev/null; then
+    warn "Daemon port ${PORT} is not listening on phone. Starting daemon..."
     start_daemon
     adb forward "tcp:${PORT}" "tcp:${PORT}"
     sleep 0.5
@@ -517,7 +661,7 @@ while $KEEP_RUNNING; do
 
     if ! is_daemon_running; then
         warn "Audio daemon dropped. Restarting..."
-        start_daemon || { sleep 2; continue; }
+        ensure_daemon_running || { sleep 2; continue; }
         adb forward "tcp:${PORT}" "tcp:${PORT}"
         sleep 0.5
     fi

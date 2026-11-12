@@ -15,6 +15,7 @@ Audio Arch operates completely offline over a physical USB cable using ADB port 
   - **Bluetooth AudioTrack Backend**: Java receiver interacting with Android's `AudioTrack` and `AudioPolicyManager` to stream desktop audio to connected Bluetooth earbuds (e.g., Redmi Buds, AirPods, Galaxy Buds).
 - **Intelligent Auto-Detection**: Automatically detects when Bluetooth earbuds are connected via `dumpsys audio` and routes audio seamlessly; falls back to Native C ALSA when no Bluetooth device is present.
 - **Bufferbloat Elimination**: Eliminates Linux pipe buffering (clamped to 4 KB via `fcntl F_SETPIPE_SZ`), enforces `TCP_NODELAY` and 4 KB socket buffers, and drains stale backlogs dynamically to prevent drift and stutter.
+- **Smart Versioning & Daemon Preservation**: Daemons are versioned (`v1.2.0`). Audio Arch verifies the installed version on the phone before transferring files, skipping unnecessary re-deployments over USB. If the daemon is already running in the correct mode, it is kept alive and reused immediately without stopping, preserving stability and avoiding audio dropouts.
 - **Safe Signal Handling**: Automatically creates a dedicated PipeWire virtual sink (`AudioArch-Sink`), makes it the default, and cleanly restores your original desktop speakers/headphones upon pressing `Ctrl+C`.
 
 ---
@@ -113,7 +114,9 @@ Terminates any background daemons running on the phone and cleans up port forwar
 | `--bt`, `--bluetooth` | Force routing through Bluetooth AudioTrack backend |
 | `--alsa`, `--c` | Force routing through Native C ALSA backend (3.5mm jack / speaker) |
 | `--test` | Send a 1-second test audio chime to verify sound |
-| `--status` | Check connection state, Bluetooth device, and daemon status |
+| `--status` | Check connection state, daemon version, and running process info |
+| `--restart` | Force restart the audio daemon on the phone |
+| `--force-deploy` | Force re-deploying daemon files to the phone even if version matches |
 | `--kill-daemon` | Stop running audio daemons on the phone |
 | `--build` | Force re-compilation of both C and Java daemons |
 | `--latency MS` | Target latency buffer in ms (default: `15`) |
