@@ -22,7 +22,7 @@ SRC_DIR="${SCRIPT_DIR}/src"
 MODE="auto" # "auto", "bt", or "alsa"
 ACTIVE_BACKEND="alsa"
 BT_DEVICE_NAME=""
-DAEMON_VERSION="1.3.3"
+DAEMON_VERSION="2.0"
 REMOTE_VER_FILE="/data/local/tmp/audioarch_version"
 FORCE_DEPLOY=false
 FORCE_RESTART=false
@@ -115,13 +115,37 @@ EOF
 # ------------------------------------------------------------------------------
 # IPC Helper (communicates with running audioarch-service)
 # ------------------------------------------------------------------------------
+is_service_running() {
+    if [[ ! -S "${IPC_SOCKET}" ]]; then
+        return 1
+    fi
+    if python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.settimeout(0.5)
+    s.connect('${IPC_SOCKET}')
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+" 2>/dev/null; then
+        return 0
+    else
+        rm -f "${IPC_SOCKET}" "${XDG_RUNTIME_DIR:-/tmp}/audioarch.state" 2>/dev/null || true
+        return 1
+    fi
+}
+
 send_ipc() {
     local cmd="$*"
-    if [[ -S "${IPC_SOCKET}" ]]; then
+    if is_service_running; then
         python3 -c "
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
+    s.settimeout(2.0)
     s.connect('${IPC_SOCKET}')
     s.sendall(('$cmd\n').encode())
     res = s.recv(4096).decode()
@@ -170,12 +194,33 @@ while [[ $# -gt 0 ]]; do
             if [[ "${1:-}" == "--force" || "${1:-}" == "-f" || "${1:-}" == "--recheck" ]]; then
                 FORCE_RECHECK=true
                 shift
+            elif [[ "${1:-}" == "--clear" || "${1:-}" == "--clean" || "${1:-}" == "-c" ]]; then
+                ACTION="clear-cache"
+                shift
+            elif [[ "${1:-}" == "--set" || "${1:-}" == "-s" ]]; then
+                ACTION="set-battery"
+                SUB_ARG="${2:-}"
+                shift 2
             fi
             ;;
         recheck|refresh|--recheck)
             ACTION="recheck"
             FORCE_RECHECK=true
             shift
+            ;;
+        clean-cache|clear-cache|--clear-cache|--clean-cache)
+            ACTION="clear-cache"
+            shift
+            ;;
+        poll-interval|--poll-interval)
+            ACTION="poll-interval"
+            if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                SUB_ARG="$2"
+                shift 2
+            else
+                SUB_ARG=""
+                shift
+            fi
             ;;
         ensure-daemon|start-daemon)
             ACTION="ensure-daemon"
@@ -374,12 +419,14 @@ build_bt_daemon() {
     fi
 
     mkdir -p "${BUILD_DIR}"
-    javac -source 7 -target 7 -d "${BUILD_DIR}" \
-        "${SRC_DIR}/stubs/android/media/"*.java \
-        "${SRC_DIR}/AudioReceiver.java" 2>/dev/null || \
-    javac -source 8 -target 8 -d "${BUILD_DIR}" \
-        "${SRC_DIR}/stubs/android/media/"*.java \
-        "${SRC_DIR}/AudioReceiver.java"
+    rm -rf "${BUILD_DIR}/com"
+    local sources_file="${BUILD_DIR}/sources.txt"
+    find "${SRC_DIR}/stubs" -name "*.java" | sed 's/^/"/;s/$/"/' > "${sources_file}"
+    echo "\"${SRC_DIR}/TwsBatteryManager.java\"" >> "${sources_file}"
+    echo "\"${SRC_DIR}/AudioReceiver.java\"" >> "${sources_file}"
+
+    javac -source 7 -target 7 -d "${BUILD_DIR}" @"${sources_file}" 2>/dev/null || \
+    javac -source 8 -target 8 -d "${BUILD_DIR}" @"${sources_file}"
 
     java -cp "$r8_jar" com.android.tools.r8.D8 \
         --no-desugaring \
@@ -536,7 +583,7 @@ ensure_daemon_running() {
 
 start_daemon() {
     adb shell "svc power stayon usb" &>/dev/null || true
-    adb shell "pkill -f getevent 2>/dev/null; pkill -f 'logcat.*HeadsetStateMachine' 2>/dev/null || true"
+    adb shell "su -c 'pkill -f getevent; pkill -f logcat' 2>/dev/null || pkill -f getevent 2>/dev/null; pkill -f logcat 2>/dev/null || true"
 
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         info "Starting Bluetooth AudioReceiver daemon on phone..."
@@ -578,7 +625,7 @@ stop_daemon() {
     else
         ok "No audio daemon was running."
     fi
-    adb shell "pkill -f getevent 2>/dev/null; pkill -f 'logcat.*HeadsetStateMachine' 2>/dev/null || true"
+    adb shell "su -c 'pkill -f getevent; pkill -f logcat' 2>/dev/null || pkill -f getevent 2>/dev/null; pkill -f logcat 2>/dev/null || true"
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
     adb forward --remove "tcp:${CTRL_PORT}" 2>/dev/null || true
 }
@@ -667,17 +714,18 @@ uninstall_service() {
 }
 
 start_service() {
-    if [[ -S "${IPC_SOCKET}" ]]; then
+    if is_service_running; then
         ok "AudioArch service is already running."
         send_ipc status || true
         return 0
     fi
+    rm -f "${IPC_SOCKET}" "${XDG_RUNTIME_DIR:-/tmp}/audioarch.state" 2>/dev/null || true
 
     if systemctl --user list-unit-files | grep -q "audioarch.service"; then
         info "Starting audioarch systemd user service..."
         systemctl --user start audioarch.service
         sleep 1.5
-        if [[ -S "${IPC_SOCKET}" ]]; then
+        if is_service_running; then
             ok "AudioArch background service started successfully."
             send_ipc status || true
         else
@@ -687,7 +735,7 @@ start_service() {
         info "Starting AudioArch service daemon in background..."
         "${SCRIPT_DIR}/bin/audioarch-service" >/dev/null 2>&1 &
         sleep 1.5
-        if [[ -S "${IPC_SOCKET}" ]]; then
+        if is_service_running; then
             ok "AudioArch background service started (PID: $!)."
         fi
     fi
@@ -695,16 +743,19 @@ start_service() {
 
 stop_service() {
     local stopped=false
-    if [[ -S "${IPC_SOCKET}" ]]; then
+    if is_service_running; then
         info "Sending stop command to running AudioArch service..."
         send_ipc stop && stopped=true
+        sleep 0.5
     fi
     systemctl --user stop audioarch.service 2>/dev/null || true
+    pkill -f "bin/audioarch-service" 2>/dev/null || true
+    rm -f "${IPC_SOCKET}" "${XDG_RUNTIME_DIR:-/tmp}/audioarch.state" 2>/dev/null || true
     ok "AudioArch service stopped. Desktop audio restored."
 }
 
 show_status() {
-    if [[ -S "${IPC_SOCKET}" ]]; then
+    if is_service_running; then
         info "AudioArch Background Service is ${GREEN}ACTIVE${NC}."
         echo ""
         send_ipc status
@@ -714,8 +765,22 @@ show_status() {
 }
 
 show_battery() {
-    if [[ -S "${IPC_SOCKET}" ]]; then
-        if [[ "$FORCE_RECHECK" == "true" ]]; then
+    if is_service_running; then
+        if [[ "$ACTION" == "clear-cache" ]]; then
+            info "Clearing Bluetooth battery cache..."
+            send_ipc clear_cache
+            return 0
+        elif [[ "$ACTION" == "set-battery" ]]; then
+            send_ipc set_battery "${SUB_ARG}"
+            return 0
+        elif [[ "$ACTION" == "poll-interval" ]]; then
+            if [[ -n "$SUB_ARG" ]]; then
+                send_ipc "poll_interval ${SUB_ARG}"
+            else
+                send_ipc poll_interval
+            fi
+            return 0
+        elif [[ "$FORCE_RECHECK" == "true" ]]; then
             info "Requesting live battery recheck from phone..."
             send_ipc recheck
         else
@@ -724,28 +789,99 @@ show_battery() {
         return 0
     fi
     check_device
-    local bt_bat
-    bt_bat=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | head -n 1 | tr -d '\r\n')
-    local bt_dev
-    bt_dev=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | sed -n '2p' | tr -d '\r\n')
-    local bt_src
-    bt_src=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | sed -n '3p' | tr -d '\r\n')
-    local bt_time
-    bt_time=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | sed -n '4p' | tr -d '\r\n')
+    if [[ "$ACTION" == "clear-cache" ]]; then
+        adb shell "rm -f /data/local/tmp/audioarch_bt_battery" 2>/dev/null || true
+        ok "Bluetooth battery cache cleared."
+        return 0
+    fi
+    if [[ "$ACTION" == "set-battery" && -n "$SUB_ARG" ]]; then
+        ensure_port_forward
+        python3 -c "
+import socket
+try:
+    s = socket.create_connection(('127.0.0.1', ${CTRL_PORT}), timeout=1.5)
+    s.sendall(b'SET_BATTERY ${SUB_ARG}\n')
+    s.close()
+except Exception: pass
+" 2>/dev/null || true
+        ok "Set battery override to ${SUB_ARG}%"
+        return 0
+    fi
+
+    local bt_dev_check
+    bt_dev_check=$(adb shell "dumpsys audio 2>/dev/null" | grep -m 1 "mBluetoothName=" | cut -d= -f2 | tr -d '\r\n')
     local phone_bat
     phone_bat=$(adb shell "cat /sys/class/power_supply/battery/capacity 2>/dev/null" | tr -d '\r\n')
 
-    local src_label=" [${bt_src:-cache}]"
-    if [[ -n "$bt_time" ]]; then
-        src_label=" [${bt_src:-cache} @ ${bt_time}]"
+    if [[ -z "$bt_dev_check" || "$bt_dev_check" == "null" || "$bt_dev_check" == "none" ]]; then
+        adb shell "rm -f /data/local/tmp/audioarch_bt_battery" 2>/dev/null || true
+        ok "Bluetooth Earbuds: ${YELLOW}Disconnected${NC} (No device connected)"
+        if [[ -n "$phone_bat" ]]; then
+            info "Phone Battery: ${CYAN}${phone_bat}%${NC}"
+        fi
+        return 0
     fi
 
-    if [[ -n "$bt_bat" && "$bt_bat" =~ ^[0-9]+$ ]]; then
-        ok "Bluetooth Earbuds: ${GREEN}${bt_dev:-${BT_DEVICE_NAME:-Bluetooth Earbuds}}${NC} — Battery: ${CYAN}${bt_bat}%${src_label}${NC}"
-    else
-        info "Bluetooth Earbuds: Battery not yet reported by headset."
+    local bt_info
+    bt_info=$(python3 -c "
+import socket
+try:
+    s = socket.create_connection(('127.0.0.1', ${CTRL_PORT}), timeout=2.0)
+    s.sendall(b'FORCE_RECHECK\n')
+    f = s.makefile('r')
+    dev = ''
+    bat = -1
+    src = 'live'
+    ts = ''
+    det = ''
+    pbat = -1
+    for _ in range(15):
+        l = f.readline()
+        if not l or 'RECHECK_COMPLETE' in l: break
+        l = l.strip()
+        if l.startswith('DEVICE:'):
+            d = l[7:].strip()
+            if d and d.lower() not in ['null', 'none', 'waiting for phone...']: dev = d
+        elif l.startswith('BATTERY|') or l.startswith('BATTERY:'):
+            sep = '|' if '|' in l else ':'
+            p = l.split(sep, 5)
+            if len(p) >= 2:
+                try: bat = int(p[1])
+                except Exception: pass
+            if len(p) >= 3 and p[2].strip() and p[2].strip().lower() not in ['null', 'none']: dev = p[2].strip()
+            if len(p) >= 4 and p[3].strip(): src = p[3].strip()
+            if len(p) >= 5 and p[4].strip(): ts = p[4].strip()
+            if len(p) >= 6 and p[5].strip(): det = p[5].strip()
+        elif l.startswith('PHONE_BATTERY:'):
+            try: pbat = int(l.split(':', 1)[1].strip())
+            except Exception: pass
+    s.close()
+    print(f'{bat}|{dev}|{src}|{ts}|{det}|{pbat}')
+except Exception:
+    print('-1||disconnected|||-1')
+" 2>/dev/null || echo "-1||disconnected|||-1")
+
+    IFS='|' read -r bt_bat bt_dev bt_src bt_time bt_det phone_bat_from_socket <<< "$bt_info"
+    if [[ -z "$phone_bat" && -n "$phone_bat_from_socket" && "$phone_bat_from_socket" != "-1" ]]; then
+        phone_bat="$phone_bat_from_socket"
     fi
-    if [[ -n "$phone_bat" ]]; then
+
+    local src_label=" [${bt_src:-live}]"
+    if [[ -n "$bt_time" ]]; then
+        src_label=" [${bt_src:-live} @ ${bt_time}]"
+    fi
+    local det_label=""
+    if [[ -n "$bt_det" ]]; then
+        det_label=" [${bt_det}]"
+    fi
+
+    if [[ -n "$bt_bat" && "$bt_bat" =~ ^[0-9]+$ && "$bt_bat" -ge 0 ]]; then
+        ok "Bluetooth Earbuds: ${GREEN}${bt_dev:-${bt_dev_check}}${NC} — Battery: ${CYAN}${bt_bat}%${src_label}${det_label}${NC}"
+    else
+        warn "Bluetooth Earbuds: ${GREEN}${bt_dev_check}${NC} connected, waiting for live AT battery update..."
+    fi
+
+    if [[ -n "$phone_bat" && "$phone_bat" -ge 0 ]]; then
         info "Phone Battery: ${CYAN}${phone_bat}%${NC}"
     fi
 }
@@ -872,12 +1008,7 @@ case "${ACTION}" in
         show_status
         exit 0
         ;;
-    battery)
-        show_battery
-        exit 0
-        ;;
-    recheck)
-        FORCE_RECHECK=true
+    battery|recheck|clear-cache|set-battery|poll-interval)
         show_battery
         exit 0
         ;;
@@ -935,8 +1066,15 @@ if [[ "$ACTION" == "run" ]]; then
             systemctl --user stop audioarch.service 2>/dev/null || true
             sleep 0.5
         fi
+        if is_service_running; then
+            warn "Stopping active audioarch background process to run standalone in terminal..."
+            send_ipc stop 2>/dev/null || true
+            pkill -f "bin/audioarch-service" 2>/dev/null || true
+            rm -f "${IPC_SOCKET}" 2>/dev/null || true
+            sleep 0.5
+        fi
     else
-        if systemctl --user is-active audioarch.service &>/dev/null || [[ -S "${IPC_SOCKET}" ]]; then
+        if systemctl --user is-active audioarch.service &>/dev/null || is_service_running; then
             info "AudioArch background service is currently ${GREEN}ACTIVE${NC}."
             echo ""
             show_status
@@ -982,9 +1120,7 @@ ORIG_SINK=$(pactl get-default-sink 2>/dev/null || pactl info | awk -F': ' '/Defa
 info "Current default audio sink: ${ORIG_SINK}"
 
 # Create Virtual Audio Sink
-local phone_model
 phone_model=$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r\n')
-local phone_mfr
 phone_mfr=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r\n')
 if [[ -n "$phone_mfr" && "${phone_model,,}" =~ ^"${phone_mfr,,}" ]]; then
     phone_model="${phone_model#$phone_mfr}"
@@ -995,7 +1131,6 @@ if [[ -z "$phone_model" || "$phone_model" == "null" ]]; then
 fi
 [[ -z "$phone_model" ]] && phone_model="Phone"
 
-local daemon_name
 if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
     daemon_name="AudioReceiver"
 else
@@ -1006,11 +1141,12 @@ SINK_DESC="${phone_model} ${daemon_name} v${DAEMON_VERSION}"
 info "Creating virtual audio device '${SINK_NAME}' (${SINK_DESC})..."
 pactl list modules short | awk -v name="${SINK_NAME}" '$0 ~ name {print $1}' | xargs -r -n 1 pactl unload-module 2>/dev/null || true
 
+escaped_desc=$(echo "${SINK_DESC}" | sed 's/ /\\ /g')
 SINK_MODULE_ID=$(pactl load-module module-null-sink \
     sink_name="${SINK_NAME}" \
     rate="${SAMPLE_RATE}" \
     channels="${CHANNELS}" \
-    "sink_properties='device.description=\"${SINK_DESC}\" node.latency=128/${SAMPLE_RATE}'")
+    "sink_properties=device.description=\"${escaped_desc}\" node.description=\"${escaped_desc}\" node.nick=\"${escaped_desc}\" node.latency=128/${SAMPLE_RATE}")
 
 ok "Virtual sink created (Module ID: ${SINK_MODULE_ID})."
 pactl set-default-sink "${SINK_NAME}"
