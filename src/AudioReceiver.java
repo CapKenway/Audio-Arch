@@ -21,16 +21,26 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class AudioReceiver {
-    public static final String VERSION = "1.3.0";
+    public static final String VERSION = "1.3.3";
     private static final int DEFAULT_AUDIO_PORT = 12345;
     private static final int DEFAULT_CTRL_PORT = 12346;
     private static final int DEFAULT_SAMPLE_RATE = 44100;
     private static volatile boolean running = true;
+    private static volatile Process currentLogcatProc = null;
+    private static volatile Process currentGeteventProc = null;
+
+    // Regex patterns for broad TWS and Bluetooth headphone battery support
+    private static final Pattern xiaomiPattern = Pattern.compile("\\+XIAOMI\\s*=\\s*1\\s*,\\s*1\\s*,\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern applePattern = Pattern.compile("\\+IPHONEACCEV\\s*=\\s*\\d+\\s*,\\s*1\\s*,\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern bievPattern = Pattern.compile("\\+BIEV\\s*=\\s*2\\s*,\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern genericPattern = Pattern.compile("\\+BAT(?:TERY)?\\s*[:=]\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
 
     // Active control clients connected from host
     private static final Set<PrintWriter> controlClients = Collections.synchronizedSet(new HashSet<PrintWriter>());
     private static volatile int lastKnownBtBattery = -1;
     private static volatile String lastKnownBtDevice = "Bluetooth Device";
+    private static volatile String btBatterySource = "cache";
+    private static volatile String btBatteryTime = "";
     private static volatile int lastKnownPhoneBattery = -1;
 
     public static void broadcast(String msg) {
@@ -44,35 +54,91 @@ public class AudioReceiver {
         }
     }
 
-    private static void saveCachedBattery(int btBat, String device) {
+    private static void loadCachedBattery() {
+        try {
+            File f = new File("/data/local/tmp/audioarch_bt_battery");
+            if (f.exists()) {
+                BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(f)));
+                String batLine = br.readLine();
+                String devLine = br.readLine();
+                String srcLine = br.readLine();
+                String tsLine = br.readLine();
+                br.close();
+                if (batLine != null && !batLine.trim().isEmpty()) {
+                    try {
+                        lastKnownBtBattery = Integer.parseInt(batLine.trim());
+                    } catch (Exception ignored) {}
+                }
+                if (devLine != null && !devLine.trim().isEmpty()) {
+                    lastKnownBtDevice = devLine.trim();
+                }
+                btBatterySource = (srcLine != null && !srcLine.trim().isEmpty()) ? srcLine.trim() : "cache";
+                if (tsLine != null && !tsLine.trim().isEmpty()) {
+                    btBatteryTime = tsLine.trim();
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private static void saveCachedBattery(int btBat, String device, String source) {
         try {
             FileOutputStream fos = new FileOutputStream("/data/local/tmp/audioarch_bt_battery");
-            String data = btBat + "\n" + (device != null ? device : "") + "\n";
+            String ts = new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date());
+            btBatteryTime = ts;
+            btBatterySource = source;
+            String data = btBat + "\n" + (device != null ? device : "") + "\n" + source + "\n" + ts + "\n";
             fos.write(data.getBytes());
             fos.close();
         } catch (Exception ignored) {}
     }
 
+    private static void doForceRecheck() {
+        loadCachedBattery();
+        String curDev = queryBluetoothDeviceName();
+        if (curDev != null && !curDev.isEmpty()) {
+            lastKnownBtDevice = curDev;
+        }
+
+        try {
+            Process pDump = Runtime.getRuntime().exec(new String[]{"logcat", "-d", "-v", "time", "HeadsetStateMachine:V", "bt-btif:V", "bta_ag_at:V", "*:S"});
+            BufferedReader rDump = new BufferedReader(new InputStreamReader(pDump.getInputStream()));
+            String dl;
+            while ((dl = rDump.readLine()) != null) {
+                int bat = parseBatteryFromLine(dl, xiaomiPattern, bievPattern, applePattern, genericPattern);
+                if (bat >= 0) {
+                    if (bat > 100) bat = 100;
+                    lastKnownBtBattery = bat;
+                    saveCachedBattery(bat, lastKnownBtDevice, "live");
+                }
+            }
+            rDump.close();
+            pDump.destroy();
+        } catch (Exception ignored) {}
+
+        int pBat = readPhoneBattery();
+        if (pBat >= 0) {
+            lastKnownPhoneBattery = pBat;
+        }
+    }
+
     private static String queryBluetoothDeviceName() {
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"dumpsys", "audio"});
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String line;
-            while ((line = reader.readLine()) != null) {
+            while ((line = r.readLine()) != null) {
                 if (line.contains("mBluetoothName=")) {
                     int idx = line.indexOf("mBluetoothName=");
-                    String name = line.substring(idx + 15).trim();
-                    if (!name.isEmpty()) {
-                        reader.close();
-                        p.destroy();
-                        return name;
-                    }
+                    String name = line.substring(idx + "mBluetoothName=".length()).trim();
+                    r.close();
+                    p.destroy();
+                    if (!name.isEmpty()) return name;
                 }
             }
-            reader.close();
+            r.close();
             p.destroy();
         } catch (Exception ignored) {}
-        return "Bluetooth Headset";
+        return (lastKnownBtDevice != null && !lastKnownBtDevice.isEmpty()) ? lastKnownBtDevice : "Bluetooth Earbuds";
     }
 
     private static int readPhoneBattery() {
@@ -88,6 +154,27 @@ public class AudioReceiver {
             }
         } catch (Exception ignored) {}
         return -1;
+    }
+
+    private static String findAvrcpDevice() {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"getevent", "-p"});
+            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line, curDev = null;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("add device")) {
+                    int colon = line.indexOf(':');
+                    if (colon > 0) curDev = line.substring(colon + 1).trim();
+                } else if (line.contains("\"AVRCP\"") && curDev != null) {
+                    r.close();
+                    p.destroy();
+                    return curDev;
+                }
+            }
+            r.close();
+            p.destroy();
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private static void startControlServer(final int ctrlPort) {
@@ -118,8 +205,9 @@ public class AudioReceiver {
 
                                         // Send initial handshake and cached state
                                         out.println("READY:AudioArch Receiver v" + VERSION);
+                                        out.println("DEVICE:" + lastKnownBtDevice);
                                         if (lastKnownBtBattery >= 0) {
-                                            out.printf("BATTERY:%d:%s%n", lastKnownBtBattery, lastKnownBtDevice);
+                                            out.printf("BATTERY:%d:%s:%s:%s%n", lastKnownBtBattery, lastKnownBtDevice, btBatterySource, btBatteryTime);
                                         }
                                         if (lastKnownPhoneBattery >= 0) {
                                             out.printf("PHONE_BATTERY:%d%n", lastKnownPhoneBattery);
@@ -130,14 +218,30 @@ public class AudioReceiver {
                                         while (running && (line = in.readLine()) != null) {
                                             line = line.trim();
                                             if (line.equalsIgnoreCase("GET_BATTERY")) {
+                                                String curDev = queryBluetoothDeviceName();
+                                                if (curDev != null && !curDev.isEmpty()) {
+                                                    lastKnownBtDevice = curDev;
+                                                }
+                                                out.println("DEVICE:" + lastKnownBtDevice);
                                                 if (lastKnownBtBattery >= 0) {
-                                                    out.printf("BATTERY:%d:%s%n", lastKnownBtBattery, lastKnownBtDevice);
+                                                    out.printf("BATTERY:%d:%s:%s:%s%n", lastKnownBtBattery, lastKnownBtDevice, btBatterySource, btBatteryTime);
                                                 }
                                                 int pBat = readPhoneBattery();
                                                 if (pBat >= 0) {
                                                     lastKnownPhoneBattery = pBat;
                                                     out.printf("PHONE_BATTERY:%d%n", pBat);
                                                 }
+                                                out.flush();
+                                            } else if (line.equalsIgnoreCase("RECHECK") || line.equalsIgnoreCase("FORCE_RECHECK")) {
+                                                doForceRecheck();
+                                                out.println("DEVICE:" + lastKnownBtDevice);
+                                                if (lastKnownBtBattery >= 0) {
+                                                    out.printf("BATTERY:%d:%s:%s:%s%n", lastKnownBtBattery, lastKnownBtDevice, btBatterySource, btBatteryTime);
+                                                }
+                                                if (lastKnownPhoneBattery >= 0) {
+                                                    out.printf("PHONE_BATTERY:%d%n", lastKnownPhoneBattery);
+                                                }
+                                                out.println("RECHECK_COMPLETE");
                                                 out.flush();
                                             } else if (line.equalsIgnoreCase("PING")) {
                                                 out.println("PONG");
@@ -171,30 +275,55 @@ public class AudioReceiver {
         serverThread.start();
     }
 
+    private static int parseBatteryFromLine(String line, Pattern xiaomi, Pattern biev, Pattern apple, Pattern generic) {
+        try {
+            Matcher m = xiaomi.matcher(line);
+            if (m.find()) return Integer.parseInt(m.group(1));
+            m = biev.matcher(line);
+            if (m.find()) return Integer.parseInt(m.group(1));
+            m = apple.matcher(line);
+            if (m.find()) {
+                int val = Integer.parseInt(m.group(1));
+                return (val <= 9) ? (val + 1) * 10 : val;
+            }
+            m = generic.matcher(line);
+            if (m.find()) return Integer.parseInt(m.group(1));
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
     private static void startTelemetryThread() {
         Thread telemetryThread = new Thread(new Runnable() {
             @Override
             public void run() {
-                // Regex patterns for broad TWS and Bluetooth headphone battery support:
-                // 1. Xiaomi / Redmi proprietary AT battery command: +XIAOMI=1,1,<bat>,...
-                Pattern xiaomiPattern = Pattern.compile("\\+XIAOMI\\s*=\\s*1\\s*,\\s*1\\s*,\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
-                // 2. Apple / Beats / Anker / Sony / JBL / Galaxy Buds battery indicator: +IPHONEACCEV=...,1,<0-9>
-                Pattern applePattern = Pattern.compile("\\+IPHONEACCEV\\s*=\\s*\\d+\\s*,\\s*1\\s*,\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
-                // 3. Bluetooth SIG HFP 1.7+ Battery Indicator: +BIEV=2,<0-100>
-                Pattern bievPattern = Pattern.compile("\\+BIEV\\s*=\\s*2\\s*,\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
-                // 4. Generic vendor AT battery format: +BAT:<0-100> or +BATTERY=<0-100>
-                Pattern genericPattern = Pattern.compile("\\+BAT(?:TERY)?\\s*[:=]\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
-
-                // Initial device name query
+                // Initial device name query & cache load
+                loadCachedBattery();
                 lastKnownBtDevice = queryBluetoothDeviceName();
                 lastKnownPhoneBattery = readPhoneBattery();
+
+                // Check recent logcat buffer for any battery commands received prior to connection
+                try {
+                    Process pDump = Runtime.getRuntime().exec(new String[]{"logcat", "-d", "-v", "time", "HeadsetStateMachine:V", "bt-btif:V", "bta_ag_at:V", "*:S"});
+                    BufferedReader rDump = new BufferedReader(new InputStreamReader(pDump.getInputStream()));
+                    String dl;
+                    while ((dl = rDump.readLine()) != null) {
+                        int bat = parseBatteryFromLine(dl, xiaomiPattern, bievPattern, applePattern, genericPattern);
+                        if (bat >= 0) {
+                            if (bat > 100) bat = 100;
+                            lastKnownBtBattery = bat;
+                            saveCachedBattery(bat, lastKnownBtDevice, "live");
+                        }
+                    }
+                    rDump.close();
+                    pDump.destroy();
+                } catch (Exception ignored) {}
 
                 Process logcatProc = null;
                 while (running) {
                     try {
-                        // Clear old logcat buffer and tail for Bluetooth HeadsetStateMachine & BTA logs
-                        String[] cmd = new String[]{"logcat", "-v", "time", "-s", "HeadsetStateMachine:E", "HeadsetStateMachine:D", "bt-btif:I", "bta_ag_at:I"};
+                        String[] cmd = new String[]{"logcat", "-v", "time", "HeadsetStateMachine:V", "bt-btif:V", "bta_ag_at:V", "*:S"};
                         logcatProc = Runtime.getRuntime().exec(cmd);
+                        currentLogcatProc = logcatProc;
                         BufferedReader reader = new BufferedReader(new InputStreamReader(logcatProc.getInputStream()));
 
                         String line;
@@ -211,37 +340,22 @@ public class AudioReceiver {
                                 }
                             }
 
-                            int detectedBattery = -1;
-                            Matcher m = xiaomiPattern.matcher(line);
-                            if (m.find()) {
-                                detectedBattery = Integer.parseInt(m.group(1));
-                            } else if ((m = bievPattern.matcher(line)).find()) {
-                                detectedBattery = Integer.parseInt(m.group(1));
-                            } else if ((m = applePattern.matcher(line)).find()) {
-                                int val = Integer.parseInt(m.group(1));
-                                // Apple level is 0..9 (or 0..100)
-                                if (val <= 9) {
-                                    detectedBattery = (val + 1) * 10;
-                                } else {
-                                    detectedBattery = val;
-                                }
-                            } else if ((m = genericPattern.matcher(line)).find()) {
-                                detectedBattery = Integer.parseInt(m.group(1));
-                            }
-
+                            int detectedBattery = parseBatteryFromLine(line, xiaomiPattern, bievPattern, applePattern, genericPattern);
                             if (detectedBattery >= 0) {
                                 if (detectedBattery > 100) detectedBattery = 100;
                                 lastKnownBtBattery = detectedBattery;
-                                saveCachedBattery(detectedBattery, lastKnownBtDevice);
-                                System.out.printf("[Telemetry] Bluetooth Battery detected: %d%% (%s)%n", detectedBattery, lastKnownBtDevice);
-                                broadcast(String.format("BATTERY:%d:%s", detectedBattery, lastKnownBtDevice));
+                                saveCachedBattery(detectedBattery, lastKnownBtDevice, "live");
+                                System.out.printf("[Telemetry] Bluetooth Battery detected: %d%% (%s) [live]%n", detectedBattery, lastKnownBtDevice);
+                                broadcast(String.format("BATTERY:%d:%s:live:%s", detectedBattery, lastKnownBtDevice, btBatteryTime));
                             }
                         }
+                        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                     } catch (Exception e) {
                         try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                     } finally {
                         if (logcatProc != null) {
                             try { logcatProc.destroy(); } catch (Exception ignored) {}
+                            if (currentLogcatProc == logcatProc) currentLogcatProc = null;
                         }
                     }
                 }
@@ -259,8 +373,14 @@ public class AudioReceiver {
                 Process geteventProc = null;
                 while (running) {
                     try {
-                        // Monitor /dev/input events for AVRCP & headset key presses
-                        geteventProc = Runtime.getRuntime().exec(new String[]{"getevent", "-l"});
+                        String avrcpDev = findAvrcpDevice();
+                        if (avrcpDev == null || avrcpDev.isEmpty() || !new File(avrcpDev).exists()) {
+                            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+                            continue;
+                        }
+                        // Target exclusively the AVRCP Bluetooth input device (no accelerometer / touchscreen overhead)
+                        geteventProc = Runtime.getRuntime().exec(new String[]{"getevent", "-l", avrcpDev});
+                        currentGeteventProc = geteventProc;
                         BufferedReader reader = new BufferedReader(new InputStreamReader(geteventProc.getInputStream()));
 
                         String line;
@@ -297,11 +417,13 @@ public class AudioReceiver {
                                 broadcast(cmd);
                             }
                         }
+                        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                     } catch (Exception e) {
                         try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                     } finally {
                         if (geteventProc != null) {
                             try { geteventProc.destroy(); } catch (Exception ignored) {}
+                            if (currentGeteventProc == geteventProc) currentGeteventProc = null;
                         }
                     }
                 }
@@ -334,6 +456,11 @@ public class AudioReceiver {
 
         System.out.printf("[Daemon] AudioArch Receiver v%s (Bluetooth & Speaker) starting on audioPort=%d, ctrlPort=%d, rate=%dHz%n",
             VERSION, audioPort, ctrlPort, sampleRate);
+
+        // Load persistent cache and query initial state
+        loadCachedBattery();
+        lastKnownBtDevice = queryBluetoothDeviceName();
+        lastKnownPhoneBattery = readPhoneBattery();
 
         // Start integrated Telemetry, Bluetooth Battery & Media Control servers
         startControlServer(ctrlPort);
@@ -371,6 +498,12 @@ public class AudioReceiver {
                     hookTrack.stop();
                     hookTrack.release();
                 } catch (Exception ignored) {}
+                if (currentLogcatProc != null) {
+                    try { currentLogcatProc.destroy(); } catch (Exception ignored) {}
+                }
+                if (currentGeteventProc != null) {
+                    try { currentGeteventProc.destroy(); } catch (Exception ignored) {}
+                }
                 System.out.println("[Daemon] Shutdown complete.");
             }
         }));

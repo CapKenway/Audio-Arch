@@ -22,10 +22,11 @@ SRC_DIR="${SCRIPT_DIR}/src"
 MODE="auto" # "auto", "bt", or "alsa"
 ACTIVE_BACKEND="alsa"
 BT_DEVICE_NAME=""
-DAEMON_VERSION="1.3.0"
+DAEMON_VERSION="1.3.3"
 REMOTE_VER_FILE="/data/local/tmp/audioarch_version"
 FORCE_DEPLOY=false
 FORCE_RESTART=false
+FORCE_RECHECK=false
 
 # Native C Daemon (Card 0 DAC)
 C_BIN="audioarch_daemon"
@@ -89,7 +90,8 @@ Service Commands:
     start             Start background audio service (systemd or standalone)
     stop              Stop audio service and restore desktop sound
     status            Check status, active mode, and Bluetooth earbud battery
-    battery           Query current Bluetooth earbud and phone battery
+    battery [--force] Query Bluetooth earbud and phone battery (indicates [cache] vs [live])
+    recheck, refresh  Force live recheck of Bluetooth earbud battery from phone
     play-pause        Toggle play/pause on desktop media players (MPRIS)
     next / prev       Skip to next/previous track on desktop media players
     volume <up|down>  Adjust desktop audio volume
@@ -138,6 +140,7 @@ finally:
 # Parse Arguments
 # ------------------------------------------------------------------------------
 ACTION="run"
+STANDALONE=false
 SUB_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -164,6 +167,19 @@ while [[ $# -gt 0 ]]; do
         battery|--battery)
             ACTION="battery"
             shift
+            if [[ "${1:-}" == "--force" || "${1:-}" == "-f" || "${1:-}" == "--recheck" ]]; then
+                FORCE_RECHECK=true
+                shift
+            fi
+            ;;
+        recheck|refresh|--recheck)
+            ACTION="recheck"
+            FORCE_RECHECK=true
+            shift
+            ;;
+        ensure-daemon|start-daemon)
+            ACTION="ensure-daemon"
+            shift
             ;;
         play-pause|next|prev)
             ACTION="$1"
@@ -173,6 +189,10 @@ while [[ $# -gt 0 ]]; do
             ACTION="volume"
             SUB_ARG="${2:-up}"
             shift 2
+            ;;
+        --standalone)
+            STANDALONE=true
+            shift
             ;;
         --bt|--bluetooth)
             MODE="bt"
@@ -516,6 +536,7 @@ ensure_daemon_running() {
 
 start_daemon() {
     adb shell "svc power stayon usb" &>/dev/null || true
+    adb shell "pkill -f getevent 2>/dev/null; pkill -f 'logcat.*HeadsetStateMachine' 2>/dev/null || true"
 
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         info "Starting Bluetooth AudioReceiver daemon on phone..."
@@ -557,6 +578,7 @@ stop_daemon() {
     else
         ok "No audio daemon was running."
     fi
+    adb shell "pkill -f getevent 2>/dev/null; pkill -f 'logcat.*HeadsetStateMachine' 2>/dev/null || true"
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
     adb forward --remove "tcp:${CTRL_PORT}" 2>/dev/null || true
 }
@@ -616,6 +638,10 @@ EOF
 
     systemctl --user daemon-reload
     systemctl --user enable audioarch.service
+    if systemctl --user is-active audioarch.service &>/dev/null; then
+        info "Restarting active AudioArch service with new binaries..."
+        systemctl --user restart audioarch.service
+    fi
     ok "AudioArch installed to: ${CYAN}${INSTALL_DIR}${NC}"
     ok "Systemd user service installed & enabled: ${CYAN}${unit_file}${NC}"
     ok "CLI shortcut created: ${CYAN}~/.local/bin/audioarch${NC}"
@@ -689,16 +715,33 @@ show_status() {
 
 show_battery() {
     if [[ -S "${IPC_SOCKET}" ]]; then
-        send_ipc battery
+        if [[ "$FORCE_RECHECK" == "true" ]]; then
+            info "Requesting live battery recheck from phone..."
+            send_ipc recheck
+        else
+            send_ipc battery
+        fi
         return 0
     fi
     check_device
     local bt_bat
     bt_bat=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | head -n 1 | tr -d '\r\n')
+    local bt_dev
+    bt_dev=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | sed -n '2p' | tr -d '\r\n')
+    local bt_src
+    bt_src=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | sed -n '3p' | tr -d '\r\n')
+    local bt_time
+    bt_time=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | sed -n '4p' | tr -d '\r\n')
     local phone_bat
     phone_bat=$(adb shell "cat /sys/class/power_supply/battery/capacity 2>/dev/null" | tr -d '\r\n')
-    if [[ -n "$bt_bat" ]]; then
-        ok "Bluetooth Earbuds: ${GREEN}${BT_DEVICE_NAME:-Redmi Buds}${NC} — Battery: ${CYAN}${bt_bat}%${NC}"
+
+    local src_label=" [${bt_src:-cache}]"
+    if [[ -n "$bt_time" ]]; then
+        src_label=" [${bt_src:-cache} @ ${bt_time}]"
+    fi
+
+    if [[ -n "$bt_bat" && "$bt_bat" =~ ^[0-9]+$ ]]; then
+        ok "Bluetooth Earbuds: ${GREEN}${bt_dev:-${BT_DEVICE_NAME:-Bluetooth Earbuds}}${NC} — Battery: ${CYAN}${bt_bat}%${src_label}${NC}"
     else
         info "Bluetooth Earbuds: Battery not yet reported by headset."
     fi
@@ -749,7 +792,7 @@ play_test_tone() {
     ensure_daemon_running
 
     info "Forwarding USB port ${PORT}..."
-    adb forward "tcp:${PORT}" "tcp:${PORT}"
+    ensure_port_forward
     sleep 0.5
 
     info "Sending 1-second test chime to phone..."
@@ -777,6 +820,7 @@ cleanup() {
         kill "${STREAM_PID}" 2>/dev/null || true
         wait "${STREAM_PID}" 2>/dev/null || true
     fi
+    pkill -P $$ -f "parec --raw -d ${SINK_NAME}.monitor" 2>/dev/null || true
 
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
     adb forward --remove "tcp:${CTRL_PORT}" 2>/dev/null || true
@@ -832,6 +876,11 @@ case "${ACTION}" in
         show_battery
         exit 0
         ;;
+    recheck)
+        FORCE_RECHECK=true
+        show_battery
+        exit 0
+        ;;
     play-pause|next|prev)
         if ! send_ipc "${ACTION}"; then
             python3 -c "
@@ -867,24 +916,63 @@ except Exception:
         stop_daemon
         exit 0
         ;;
+    ensure-daemon|start-daemon)
+        check_device
+        deploy_receiver
+        ensure_daemon_running
+        ensure_port_forward
+        exit 0
+        ;;
     run)
         ;;
 esac
+
+# Handle active service or standalone mode
+if [[ "$ACTION" == "run" ]]; then
+    if [[ "$STANDALONE" == "true" ]]; then
+        if systemctl --user is-active audioarch.service &>/dev/null; then
+            warn "Stopping active audioarch background service to run standalone in terminal..."
+            systemctl --user stop audioarch.service 2>/dev/null || true
+            sleep 0.5
+        fi
+    else
+        if systemctl --user is-active audioarch.service &>/dev/null || [[ -S "${IPC_SOCKET}" ]]; then
+            info "AudioArch background service is currently ${GREEN}ACTIVE${NC}."
+            echo ""
+            show_status
+            echo ""
+            info "To manage the service:"
+            info "  Check status:         audioarch status"
+            info "  Query earbud battery: audioarch battery"
+            info "  Stop service:         audioarch stop"
+            info "  Run in terminal only: ./audio_arch.sh --standalone"
+            exit 0
+        fi
+    fi
+fi
+
+is_daemon_listening() {
+    adb shell netstat -an 2>/dev/null | grep "${PORT}" | grep -q "LISTEN"
+}
+
+ensure_port_forward() {
+    adb forward "tcp:${PORT}" "tcp:${PORT}" >/dev/null 2>&1 || true
+    adb forward "tcp:${CTRL_PORT}" "tcp:${CTRL_PORT}" >/dev/null 2>&1 || true
+}
 
 check_device
 deploy_receiver
 ensure_daemon_running
 
 info "Mapping USB TCP ports (${PORT} audio, ${CTRL_PORT} control) -> phone..."
-adb forward "tcp:${PORT}" "tcp:${PORT}"
-adb forward "tcp:${CTRL_PORT}" "tcp:${CTRL_PORT}"
+ensure_port_forward
 ok "Ports mapped."
 
 # Verify receiver listener socket
-if ! adb shell "netstat -an 2>/dev/null | grep -E '12345.*LISTEN'" &>/dev/null; then
+if ! is_daemon_listening; then
     warn "Daemon port ${PORT} is not listening on phone. Starting daemon..."
     start_daemon
-    adb forward "tcp:${PORT}" "tcp:${PORT}"
+    ensure_port_forward
     sleep 0.5
 fi
 ok "Phone receiver connection verified."
@@ -894,14 +982,35 @@ ORIG_SINK=$(pactl get-default-sink 2>/dev/null || pactl info | awk -F': ' '/Defa
 info "Current default audio sink: ${ORIG_SINK}"
 
 # Create Virtual Audio Sink
-info "Creating virtual audio device '${SINK_NAME}'..."
+local phone_model
+phone_model=$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r\n')
+local phone_mfr
+phone_mfr=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r\n')
+if [[ -n "$phone_mfr" && "${phone_model,,}" =~ ^"${phone_mfr,,}" ]]; then
+    phone_model="${phone_model#$phone_mfr}"
+    phone_model="${phone_model#"${phone_model%%[![:space:]]*}"}"
+fi
+if [[ -z "$phone_model" || "$phone_model" == "null" ]]; then
+    phone_model=$(adb devices -l 2>/dev/null | grep -o 'model:[^ ]*' | cut -d: -f2 | tr '_' ' ' | head -n 1)
+fi
+[[ -z "$phone_model" ]] && phone_model="Phone"
+
+local daemon_name
+if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
+    daemon_name="AudioReceiver"
+else
+    daemon_name="audioarch_daemon"
+fi
+SINK_DESC="${phone_model} ${daemon_name} v${DAEMON_VERSION}"
+
+info "Creating virtual audio device '${SINK_NAME}' (${SINK_DESC})..."
 pactl list modules short | awk -v name="${SINK_NAME}" '$0 ~ name {print $1}' | xargs -r -n 1 pactl unload-module 2>/dev/null || true
 
 SINK_MODULE_ID=$(pactl load-module module-null-sink \
     sink_name="${SINK_NAME}" \
     rate="${SAMPLE_RATE}" \
     channels="${CHANNELS}" \
-    sink_properties="device.description='${SINK_DESC}' node.latency=128/${SAMPLE_RATE}")
+    "sink_properties='device.description=\"${SINK_DESC}\" node.latency=128/${SAMPLE_RATE}'")
 
 ok "Virtual sink created (Module ID: ${SINK_MODULE_ID})."
 pactl set-default-sink "${SINK_NAME}"
@@ -927,10 +1036,12 @@ while $KEEP_RUNNING; do
         sleep 1
     fi
 
-    if ! is_daemon_running; then
-        warn "Audio daemon dropped. Restarting..."
+    ensure_port_forward
+
+    if ! is_daemon_running || ! is_daemon_listening; then
+        warn "Audio daemon dropped or not listening on phone. Restarting..."
         ensure_daemon_running || { sleep 2; continue; }
-        adb forward "tcp:${PORT}" "tcp:${PORT}"
+        ensure_port_forward
         sleep 0.5
     fi
 
@@ -942,6 +1053,7 @@ while $KEEP_RUNNING; do
         --process-time-msec="${LATENCY_MS}" 2>/dev/null | python3 "${SRC_DIR}/fast_sender.py" "${PORT}" &
     STREAM_PID=$!
     wait "${STREAM_PID}" 2>/dev/null || true
+    pkill -P $$ -f "parec --raw -d ${SINK_NAME}.monitor" 2>/dev/null || true
     if $KEEP_RUNNING; then
         warn "Stream connection dropped, reconnecting in 1s..."
         sleep 1

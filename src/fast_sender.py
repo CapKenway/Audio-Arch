@@ -14,17 +14,29 @@ def main():
     except Exception:
         pass
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s = None
+    connected = False
+    for _ in range(10):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            except Exception:
+                pass
+            sock.connect(("127.0.0.1", port))
+            s = sock
+            connected = True
+            break
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            import time
+            time.sleep(0.3)
 
-    try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-    except Exception:
-        pass
-
-    try:
-        s.connect(("127.0.0.1", port))
-    except Exception as e:
+    if not connected or s is None:
         sys.exit(1)
 
     chunk_size = 2048  # ~11.6ms of 16-bit 44.1kHz stereo

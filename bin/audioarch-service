@@ -3,6 +3,8 @@
 AudioArch Background Service Daemon
 Maintains the PipeWire null-sink, low-latency audio stream, ADB tunnel,
 bidirectional telemetry/remote-control channel, and KDE integration.
+Fully device-lifecycle aware: idle with PC audio untouched when phone is disconnected;
+auto-activates when phone is plugged in.
 """
 
 import os
@@ -26,14 +28,17 @@ CTRL_PORT = 12346
 SAMPLE_RATE = 44100
 CHANNELS = 2
 SINK_NAME = "AudioArch-Sink"
-SINK_DESC = "Android Phone Audio Card"
+DAEMON_VERSION = "1.3.3"
 
 state = {
-    "status": "starting",
-    "mode": "Bluetooth",
-    "bt_device": "Bluetooth Earbuds",
+    "status": "waiting_for_device",
+    "mode": "idle",
+    "bt_device": "Waiting for phone...",
     "bt_battery": -1,
+    "bt_battery_source": "cache",
+    "bt_battery_time": "",
     "phone_battery": -1,
+    "daemon_version": DAEMON_VERSION,
     "latency_ms": 15,
     "audio_pid": None,
     "service_pid": os.getpid()
@@ -53,9 +58,88 @@ def save_state():
     except Exception:
         pass
 
+def is_device_connected():
+    """Checks if an Android phone is connected and authorized via ADB."""
+    try:
+        res = subprocess.run(["adb", "get-state"], capture_output=True, text=True, timeout=2)
+        return res.returncode == 0 and "device" in res.stdout
+    except Exception:
+        return False
+
+def query_device_telemetry():
+    """Queries phone via ADB for Bluetooth device name and cached battery."""
+    global state
+    try:
+        cmd = "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null; echo '==='; dumpsys audio 2>/dev/null | grep mBluetoothName="
+        out = subprocess.check_output(["adb", "shell", cmd], text=True, stderr=subprocess.DEVNULL, timeout=2)
+        parts = out.split("===")
+        cache_part = parts[0].strip() if len(parts) > 0 else ""
+        dump_part = parts[1].strip() if len(parts) > 1 else ""
+
+        if cache_part:
+            lines = cache_part.splitlines()
+            if len(lines) >= 1 and lines[0].strip().isdigit():
+                val = int(lines[0].strip())
+                if val >= 0:
+                    state["bt_battery"] = val
+            if len(lines) >= 2 and lines[1].strip():
+                state["bt_device"] = lines[1].strip()
+            if len(lines) >= 3 and lines[2].strip():
+                state["bt_battery_source"] = lines[2].strip()
+            if len(lines) >= 4 and lines[3].strip():
+                state["bt_battery_time"] = lines[3].strip()
+
+        if "mBluetoothName=" in dump_part:
+            dev = dump_part.split("mBluetoothName=")[-1].strip()
+            if dev:
+                state["bt_device"] = dev
+                state["mode"] = "Bluetooth"
+
+        if state.get("bt_device") in ["Waiting for phone...", "", "None", "null"]:
+            state["bt_device"] = "Bluetooth Earbuds"
+
+        save_state()
+    except Exception:
+        pass
+
+def ensure_adb_ports():
+    """Maps ADB forward ports 12345 and 12346."""
+    try:
+        subprocess.run(["adb", "forward", f"tcp:{AUDIO_PORT}", f"tcp:{AUDIO_PORT}"],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "forward", f"tcp:{CTRL_PORT}", f"tcp:{CTRL_PORT}"],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def is_daemon_listening():
+    """Checks whether port 12345 is listening on the phone."""
+    try:
+        out = subprocess.check_output(
+            ["adb", "shell", "netstat -an"],
+            text=True, stderr=subprocess.DEVNULL, timeout=2
+        )
+        return any(str(AUDIO_PORT) in line and "LISTEN" in line for line in out.splitlines())
+    except Exception:
+        return False
+
+def ensure_phone_daemon():
+    """Verifies that the audio receiver daemon is listening on the phone; starts it if needed."""
+    if is_daemon_listening():
+        return True
+    setup_script = os.path.join(SCRIPT_DIR, "audio_arch.sh")
+    if os.path.exists(setup_script):
+        try:
+            subprocess.run([setup_script, "ensure-daemon"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except Exception:
+            pass
+    ensure_adb_ports()
+    return is_daemon_listening()
+
 def dispatch_mpris(action):
     """Dispatches media commands to active desktop media players (Spotify, Firefox, VLC, Chrome)."""
-    # Try playerctl first if installed
     try:
         if action == "play-pause":
             res = subprocess.run(["playerctl", "play-pause"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -69,7 +153,6 @@ def dispatch_mpris(action):
     except Exception:
         pass
 
-    # Direct D-Bus MPRIS fallback via busctl
     method_map = {
         "play-pause": "PlayPause",
         "next": "Next",
@@ -79,7 +162,6 @@ def dispatch_mpris(action):
     if not method: return
 
     try:
-        # Find active MPRIS players on the session bus
         out = subprocess.check_output(["busctl", "--user", "list", "--no-legend"], text=True)
         for line in out.splitlines():
             parts = line.split()
@@ -110,45 +192,112 @@ def dispatch_volume(direction):
         subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", step],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def setup_pipewire_sink():
-    global orig_sink, sink_module_id
+def get_phone_model():
+    global state
+    model = state.get("phone_model")
+    if model and model not in ["null", "None", "", "Phone"]:
+        return model
     try:
-        orig_sink = subprocess.check_output(
+        raw_model = subprocess.check_output(
+            ["adb", "shell", "getprop ro.product.model 2>/dev/null"],
+            text=True, stderr=subprocess.DEVNULL, timeout=2
+        ).strip()
+        if raw_model and raw_model.lower() not in ["null", "none", "unknown", ""]:
+            try:
+                mfr = subprocess.check_output(
+                    ["adb", "shell", "getprop ro.product.manufacturer 2>/dev/null"],
+                    text=True, stderr=subprocess.DEVNULL, timeout=1
+                ).strip()
+                if mfr and raw_model.lower().startswith(mfr.lower()):
+                    raw_model = raw_model[len(mfr):].strip()
+            except Exception:
+                pass
+            state["phone_model"] = raw_model
+            return raw_model
+    except Exception:
+        pass
+
+    try:
+        dev_out = subprocess.check_output(["adb", "devices", "-l"], text=True, stderr=subprocess.DEVNULL, timeout=2)
+        for part in dev_out.split():
+            if part.startswith("model:"):
+                m = part.split(":", 1)[1].replace("_", " ").strip()
+                if m:
+                    state["phone_model"] = m
+                    return m
+    except Exception:
+        pass
+
+    return "Phone"
+
+def get_sink_description():
+    """Generates virtual audio sink description: 'Phone_model daemon_used daemon_version'."""
+    mode = state.get("mode", "Bluetooth")
+    phone = get_phone_model()
+    ver = DAEMON_VERSION
+    daemon_name = "AudioReceiver" if mode == "Bluetooth" else "audioarch_daemon"
+    return f"{phone} {daemon_name} v{ver}"
+
+def setup_pipewire_sink():
+    """Creates the virtual null-sink and routes default PC audio into it."""
+    global orig_sink, sink_module_id
+    if sink_module_id:
+        return
+
+    try:
+        cur_sink = subprocess.check_output(
             ["pactl", "get-default-sink"], text=True, stderr=subprocess.DEVNULL
         ).strip()
+        if cur_sink and cur_sink != SINK_NAME:
+            orig_sink = cur_sink
     except Exception:
         orig_sink = None
 
-    # Unload any existing duplicate module
+    # Unload any residual duplicate module
     try:
         modules = subprocess.check_output(["pactl", "list", "modules", "short"], text=True).splitlines()
         for mod in modules:
             if SINK_NAME in mod:
                 mid = mod.split()[0]
-                subprocess.run(["pactl", "unload-module", mid], check=False)
+                subprocess.run(["pactl", "unload-module", mid], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
+    sink_desc = get_sink_description()
+    prop_arg = f"sink_properties='device.description=\"{sink_desc}\" node.latency=128/{SAMPLE_RATE}'"
+
     try:
-        latency = state.get("latency_ms", 15)
         out = subprocess.check_output([
             "pactl", "load-module", "module-null-sink",
             f"sink_name={SINK_NAME}",
             f"rate={SAMPLE_RATE}",
             f"channels={CHANNELS}",
-            f"sink_properties=device.description='{SINK_DESC}' node.latency=128/{SAMPLE_RATE}"
+            prop_arg
         ], text=True).strip()
         sink_module_id = out
-        subprocess.run(["pactl", "set-default-sink", SINK_NAME], check=False)
-        print(f"[Service] Virtual sink created (Module ID: {sink_module_id}). Default sink redirected.")
+        subprocess.run(["pactl", "set-default-sink", SINK_NAME], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[Service] Virtual sink created: '{sink_desc}' (Module ID: {sink_module_id}). Desktop audio directed to AudioArch.")
     except Exception as e:
         print(f"[Service] Warning: Failed to create null-sink: {e}")
 
+def teardown_pipewire_sink():
+    """Unloads the virtual null-sink and restores original default PC speakers."""
+    global orig_sink, sink_module_id
+    if orig_sink:
+        print(f"[Service] Restoring original default audio sink: {orig_sink}")
+        subprocess.run(["pactl", "set-default-sink", orig_sink], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        orig_sink = None
+
+    if sink_module_id:
+        print(f"[Service] Unloading virtual sink ({sink_module_id})...")
+        subprocess.run(["pactl", "unload-module", sink_module_id], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sink_module_id = None
+
 def cleanup(sig=None, frame=None):
-    global running, sink_module_id, orig_sink, audio_proc, tray_proc
+    global running, audio_proc, tray_proc
     if not running: return
     running = False
-    print("\n[Service] Shutting down audio pipeline and services...")
+    print("\n[Service] Shutting down AudioArch background service...")
 
     if audio_proc:
         try: audio_proc.terminate(); audio_proc.wait(timeout=1)
@@ -158,14 +307,7 @@ def cleanup(sig=None, frame=None):
         try: tray_proc.terminate()
         except Exception: pass
 
-    # Restore default sink
-    if orig_sink:
-        print(f"[Service] Restoring original default audio sink: {orig_sink}")
-        subprocess.run(["pactl", "set-default-sink", orig_sink], check=False)
-
-    if sink_module_id:
-        print(f"[Service] Unloading virtual sink ({sink_module_id})...")
-        subprocess.run(["pactl", "unload-module", sink_module_id], check=False)
+    teardown_pipewire_sink()
 
     # Clean IPC files
     for p in [IPC_SOCKET, STATE_FILE]:
@@ -182,30 +324,54 @@ def control_client_thread():
     """Connects to Android phone control port 12346 to receive telemetry and media events."""
     global running, state
     while running:
+        if not is_device_connected() or not is_daemon_listening():
+            time.sleep(2)
+            continue
+
         s = None
         try:
-            s = socket.create_connection(("127.0.0.1", CTRL_PORT), timeout=5)
+            ensure_adb_ports()
+            s = socket.create_connection(("127.0.0.1", CTRL_PORT), timeout=3)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(5.0)
             f = s.makefile("r")
-            # Request current battery
             s.sendall(b"GET_BATTERY\n")
 
-            while running:
-                line = f.readline()
+            while running and is_device_connected():
+                try:
+                    line = f.readline()
+                except socket.timeout:
+                    try:
+                        s.sendall(b"GET_BATTERY\n")
+                    except Exception:
+                        break
+                    continue
+
                 if not line: break
                 line = line.strip()
                 if not line: continue
 
-                if line.startswith("BATTERY:"):
-                    # Format: BATTERY:<pct>:<deviceName>
-                    parts = line.split(":", 2)
+                if line.startswith("DEVICE:"):
+                    dev = line[7:].strip()
+                    if dev and dev.lower() not in ["waiting for phone...", "none", "null"]:
+                        state["bt_device"] = dev
+                        save_state()
+                elif line.startswith("BATTERY:"):
+                    parts = line.split(":", 4)
                     if len(parts) >= 2:
                         try:
                             state["bt_battery"] = int(parts[1])
-                            if len(parts) >= 3 and parts[2]:
-                                state["bt_device"] = parts[2]
+                            if len(parts) >= 3 and parts[2].strip() and parts[2].strip().lower() not in ["null", "none"]:
+                                state["bt_device"] = parts[2].strip()
+                            if len(parts) >= 4 and parts[3].strip():
+                                state["bt_battery_source"] = parts[3].strip()
+                            if len(parts) >= 5 and parts[4].strip():
+                                state["bt_battery_time"] = parts[4].strip()
                             save_state()
-                            print(f"[Control] Telemetry update: {state['bt_device']} Battery = {state['bt_battery']}%")
+                            src = state.get("bt_battery_source", "cache")
+                            ts = state.get("bt_battery_time", "")
+                            ts_str = f" @ {ts}" if ts else ""
+                            print(f"[Control] Telemetry update: {state['bt_device']} Battery = {state['bt_battery']}% [{src}{ts_str}]")
                         except ValueError: pass
                 elif line.startswith("PHONE_BATTERY:"):
                     parts = line.split(":", 1)
@@ -215,7 +381,6 @@ def control_client_thread():
                             save_state()
                         except ValueError: pass
                 elif line.startswith("MEDIA:"):
-                    # Media control event from Bluetooth earbuds or phone hardware keys!
                     ev = line[6:]
                     print(f"[RemoteControl] Received remote earbud action: {ev}")
                     if ev == "PLAY_PAUSE":
@@ -238,43 +403,84 @@ def control_client_thread():
             time.sleep(2)
 
 def audio_streamer_thread():
-    """Supervises the parec -> fast_sender pipeline."""
-    global running, audio_proc
+    """Supervises the parec -> fast_sender pipeline with full device lifecycle awareness."""
+    global running, audio_proc, sink_module_id
     fast_sender_path = os.path.join(SRC_DIR, "fast_sender.py")
 
     while running:
+        if not is_device_connected():
+            if sink_module_id:
+                print("[Service] Phone disconnected. Restoring default audio and waiting...")
+                teardown_pipewire_sink()
+            state["status"] = "waiting_for_device"
+            state["mode"] = "idle"
+            state["bt_device"] = "Waiting for phone..."
+            state["bt_battery"] = -1
+            state["phone_battery"] = -1
+            state["audio_pid"] = None
+            save_state()
+            time.sleep(2)
+            continue
+
+        # Device is connected!
+        ensure_adb_ports()
+        query_device_telemetry()
+
+        if not is_daemon_listening():
+            print("[Service] Phone daemon not listening on port 12345. Initializing...")
+            ensure_phone_daemon()
+            ensure_adb_ports()
+            if not is_daemon_listening():
+                time.sleep(2)
+                continue
+
+        # Daemon is ready and listening! Ensure virtual sink is loaded
+        if not sink_module_id:
+            setup_pipewire_sink()
+
+        latency_ms = str(state.get("latency_ms", 15))
+        env = os.environ.copy()
+        env["PIPEWIRE_LATENCY"] = f"128/{SAMPLE_RATE}"
+        env["PULSE_LATENCY_MSEC"] = latency_ms
+
+        parec_cmd = [
+            "parec", "--raw",
+            "-d", f"{SINK_NAME}.monitor",
+            "--format=s16le",
+            f"--rate={SAMPLE_RATE}",
+            f"--channels={CHANNELS}",
+            f"--latency-msec={latency_ms}",
+            f"--process-time-msec={latency_ms}"
+        ]
+        sender_cmd = [sys.executable, fast_sender_path, str(AUDIO_PORT)]
+
+        p1 = None
+        p2 = None
         try:
-            # Check if phone daemon is responsive
-            subprocess.run(["adb", "forward", f"tcp:{AUDIO_PORT}", f"tcp:{AUDIO_PORT}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["adb", "forward", f"tcp:{CTRL_PORT}", f"tcp:{CTRL_PORT}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            latency_ms = str(state.get("latency_ms", 15))
-            env = os.environ.copy()
-            env["PIPEWIRE_LATENCY"] = f"128/{SAMPLE_RATE}"
-            env["PULSE_LATENCY_MSEC"] = latency_ms
-
-            parec_cmd = [
-                "parec", "--raw",
-                "-d", f"{SINK_NAME}.monitor",
-                "--format=s16le",
-                f"--rate={SAMPLE_RATE}",
-                f"--channels={CHANNELS}",
-                f"--latency-msec={latency_ms}",
-                f"--process-time-msec={latency_ms}"
-            ]
-            sender_cmd = [sys.executable, fast_sender_path, str(AUDIO_PORT)]
-
             p1 = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
             p2 = subprocess.Popen(sender_cmd, stdin=p1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             p1.stdout.close()
             audio_proc = p2
             state["audio_pid"] = p2.pid
             state["status"] = "streaming"
+            state["mode"] = "Bluetooth"
             save_state()
 
             p2.wait()
-        except Exception as e:
-            time.sleep(1)
+        except Exception:
+            pass
+        finally:
+            if p1 and p1.poll() is None:
+                p1.terminate()
+                try: p1.wait(timeout=1)
+                except Exception: p1.kill()
+            if p2 and p2.poll() is None:
+                p2.terminate()
+                try: p2.wait(timeout=1)
+                except Exception: p2.kill()
+            audio_proc = None
+            state["audio_pid"] = None
+
         if running:
             time.sleep(1)
 
@@ -310,8 +516,65 @@ def ipc_server_thread():
                 elif action == "battery":
                     bt = state.get("bt_battery", -1)
                     dev = state.get("bt_device", "Bluetooth Headset")
+                    src = state.get("bt_battery_source", "cache")
+                    ts = state.get("bt_battery_time", "")
                     pb = state.get("phone_battery", -1)
-                    resp = f"Headset: {dev} ({bt}%)\nPhone: {pb}%\n" if bt >= 0 else f"Headset: Detecting...\nPhone: {pb}%\n"
+
+                    src_str = f" [{src}]" if src else ""
+                    if ts:
+                        src_str = f" [{src} @ {ts}]"
+
+                    if state.get("status") == "waiting_for_device":
+                        resp = "Phone: Not connected\nHeadset: Not connected\n"
+                    elif bt >= 0:
+                        resp = f"Headset: {dev} ({bt}%{src_str})\nPhone: {pb}%\n"
+                    else:
+                        resp = f"Headset: {dev} (Detecting battery...)\nPhone: {pb}%\n"
+                    c.sendall(resp.encode())
+                elif action in ["recheck", "refresh"]:
+                    try:
+                        s_ctrl = socket.create_connection(("127.0.0.1", CTRL_PORT), timeout=2)
+                        s_ctrl.sendall(b"FORCE_RECHECK\n")
+                        s_ctrl.settimeout(3.0)
+                        f_ctrl = s_ctrl.makefile("r")
+                        while True:
+                            l = f_ctrl.readline()
+                            if not l or "RECHECK_COMPLETE" in l: break
+                            l = l.strip()
+                            if l.startswith("DEVICE:"):
+                                d = l[7:].strip()
+                                if d and d.lower() not in ["waiting for phone...", "none", "null"]:
+                                    state["bt_device"] = d
+                            elif l.startswith("BATTERY:"):
+                                parts = l.split(":", 4)
+                                if len(parts) >= 2:
+                                    try: state["bt_battery"] = int(parts[1])
+                                    except ValueError: pass
+                                if len(parts) >= 3 and parts[2].strip() and parts[2].strip().lower() not in ["null", "none"]:
+                                    state["bt_device"] = parts[2].strip()
+                                if len(parts) >= 4 and parts[3].strip():
+                                    state["bt_battery_source"] = parts[3].strip()
+                                if len(parts) >= 5 and parts[4].strip():
+                                    state["bt_battery_time"] = parts[4].strip()
+                            elif l.startswith("PHONE_BATTERY:"):
+                                parts = l.split(":", 1)
+                                if len(parts) >= 2:
+                                    try: state["phone_battery"] = int(parts[1])
+                                    except ValueError: pass
+                        s_ctrl.close()
+                    except Exception:
+                        query_device_telemetry()
+
+                    save_state()
+                    bt = state.get("bt_battery", -1)
+                    dev = state.get("bt_device", "Bluetooth Headset")
+                    src = state.get("bt_battery_source", "cache")
+                    ts = state.get("bt_battery_time", "")
+                    pb = state.get("phone_battery", -1)
+                    src_str = f" [{src}]" if src else ""
+                    if ts:
+                        src_str = f" [{src} @ {ts}]"
+                    resp = f"Headset: {dev} ({bt}%{src_str})\nPhone: {pb}%\n"
                     c.sendall(resp.encode())
                 elif action == "play-pause":
                     dispatch_mpris("play-pause")
@@ -352,19 +615,10 @@ def main():
 
     print(f"[Service] Starting AudioArch background service (PID: {os.getpid()})...")
 
-    # Ensure phone daemon is deployed and active
-    setup_script = os.path.join(SCRIPT_DIR, "audio_arch.sh")
-    try:
-        subprocess.run([setup_script, "--status"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-    setup_pipewire_sink()
-
     # Start KDE Plasma system tray icon if available
     global tray_proc
     tray_script = os.path.join(SRC_DIR, "audioarch_tray.py")
-    if os.path.exists(tray_script) and "WAYLAND_DISPLAY" in os.environ or "DISPLAY" in os.environ:
+    if os.path.exists(tray_script) and ("WAYLAND_DISPLAY" in os.environ or "DISPLAY" in os.environ):
         try:
             tray_proc = subprocess.Popen([sys.executable, tray_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print("[Service] KDE Plasma System Tray applet started.")
@@ -372,20 +626,19 @@ def main():
             pass
 
     # Launch worker threads
-    t_ctrl = threading.Thread(target=control_client_thread, daemon=True, name="ControlClientThread")
     t_ipc = threading.Thread(target=ipc_server_thread, daemon=True, name="IPCServerThread")
+    t_ctrl = threading.Thread(target=control_client_thread, daemon=True, name="ControlClientThread")
     t_audio = threading.Thread(target=audio_streamer_thread, daemon=True, name="AudioStreamerThread")
 
-    t_ctrl.start()
     t_ipc.start()
+    t_ctrl.start()
     t_audio.start()
 
     save_state()
-    print("[Service] AudioArch Service is ACTIVE and streaming. Ready for CLI and earbud controls.")
+    print("[Service] AudioArch Service is ACTIVE. Ready for CLI and earbud controls.")
 
     while running:
         time.sleep(1)
 
 if __name__ == "__main__":
     main()
-
