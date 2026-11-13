@@ -17,7 +17,7 @@
 #include <netinet/tcp.h>
 #include <tinyalsa/asoundlib.h>
 
-#define DAEMON_VERSION "1.2.0"
+#define DAEMON_VERSION "1.3.0"
 
 static volatile int running = 1;
 

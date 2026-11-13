@@ -1,0 +1,15 @@
+[Unit]
+Description=Audio Arch - Ultra-Low Latency USB Audio & Bluetooth Bridge
+After=pipewire.service wireplumber.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.audioarch/bin/audioarch-service
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+

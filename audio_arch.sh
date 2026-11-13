@@ -22,7 +22,7 @@ SRC_DIR="${SCRIPT_DIR}/src"
 MODE="auto" # "auto", "bt", or "alsa"
 ACTIVE_BACKEND="alsa"
 BT_DEVICE_NAME=""
-DAEMON_VERSION="1.2.0"
+DAEMON_VERSION="1.3.0"
 REMOTE_VER_FILE="/data/local/tmp/audioarch_version"
 FORCE_DEPLOY=false
 FORCE_RESTART=false
@@ -41,12 +41,14 @@ REMOTE_BT_LOG="/data/local/tmp/audio_receiver.log"
 REMOTE_CACHE="/data/local/tmp/dalvik-cache"
 
 PORT=12345
+CTRL_PORT=12346
 SAMPLE_RATE=44100
 CHANNELS=2
 LATENCY_MS=15
 CLI_LATENCY_SET=false
 SINK_NAME="AudioArch-Sink"
 SINK_DESC="Android Phone Audio Card"
+IPC_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/audioarch.sock"
 
 STREAM_PID=""
 SINK_MODULE_ID=""
@@ -75,21 +77,32 @@ err()   { echo -e "${RED}[✗]${NC} $*" >&2; }
 # ------------------------------------------------------------------------------
 usage() {
     cat << EOF
-Usage: $(basename "$0") [OPTIONS]
+Usage: $(basename "$0") [COMMAND|OPTIONS]
 
 Stream Arch Linux desktop audio to Android over USB with lowest latency.
 Auto-routes to Bluetooth earphones/headset if connected, or direct ALSA DAC.
+Integrates Bluetooth earbud battery telemetry & earbud remote controls into KDE.
 
-Options:
+Service Commands:
+    --install-service Install systemd user service (~/.config/systemd/user/audioarch.service)
+    --uninstall-service Uninstall systemd user service
+    start             Start background audio service (systemd or standalone)
+    stop              Stop audio service and restore desktop sound
+    status            Check status, active mode, and Bluetooth earbud battery
+    battery           Query current Bluetooth earbud and phone battery
+    play-pause        Toggle play/pause on desktop media players (MPRIS)
+    next / prev       Skip to next/previous track on desktop media players
+    volume <up|down>  Adjust desktop audio volume
+
+Streaming Options:
     --bt, --bluetooth Force routing to Bluetooth earphones (via AudioTrack)
     --alsa, --c       Force routing to phone 3.5mm jack/speaker (via Native C ALSA)
-    --status          Check link state, version info, and Android daemon status
     --test            Send a test audio chime to verify sound on the phone
     --build           Force re-compilation of receiver daemons
     --restart         Force restart the audio daemon on the phone
     --force-deploy    Force re-deploying daemon files to the phone
     --kill-daemon     Stop all audio daemons on the phone and exit
-    --port PORT       TCP port for ADB forward (default: 12345)
+    --port PORT       TCP port for audio stream (default: 12345)
     --rate RATE       Audio sample rate in Hz (default: 44100)
     --latency MS      Latency buffer target in ms (default: 15)
     --help            Display this help message
@@ -98,21 +111,75 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+# IPC Helper (communicates with running audioarch-service)
+# ------------------------------------------------------------------------------
+send_ipc() {
+    local cmd="$*"
+    if [[ -S "${IPC_SOCKET}" ]]; then
+        python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect('${IPC_SOCKET}')
+    s.sendall(('$cmd\n').encode())
+    res = s.recv(4096).decode()
+    sys.stdout.write(res)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+# ------------------------------------------------------------------------------
 # Parse Arguments
 # ------------------------------------------------------------------------------
 ACTION="run"
+SUB_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --install-service|install-service)
+            ACTION="install-service"
+            shift
+            ;;
+        --uninstall-service|uninstall-service)
+            ACTION="uninstall-service"
+            shift
+            ;;
+        start|--start)
+            ACTION="start"
+            shift
+            ;;
+        stop|--stop)
+            ACTION="stop"
+            shift
+            ;;
+        status|--status)
+            ACTION="status"
+            shift
+            ;;
+        battery|--battery)
+            ACTION="battery"
+            shift
+            ;;
+        play-pause|next|prev)
+            ACTION="$1"
+            shift
+            ;;
+        volume)
+            ACTION="volume"
+            SUB_ARG="${2:-up}"
+            shift 2
+            ;;
         --bt|--bluetooth)
             MODE="bt"
             shift
             ;;
         --alsa|--c)
             MODE="alsa"
-            shift
-            ;;
-        --status)
-            ACTION="status"
             shift
             ;;
         --test)
@@ -227,14 +294,24 @@ check_device() {
 build_c_daemon() {
     info "Compiling native C ARM AudioArch daemon..."
     local toolchain_dir="${HOME}/.cache/audio_arch/toolchain"
-    local arm_gcc="${toolchain_dir}/bin/arm-linux-gcc"
-    local arm_strip="${toolchain_dir}/bin/arm-linux-strip"
+    local arm_gcc
+    arm_gcc=$(find "${toolchain_dir}/bin" -name "*gcc*.br_real" 2>/dev/null | head -n 1 || true)
+    if [[ -z "$arm_gcc" || ! -x "$arm_gcc" ]]; then
+        arm_gcc="${toolchain_dir}/bin/arm-linux-gcc"
+    fi
+    local arm_strip
+    arm_strip=$(find "${toolchain_dir}/bin" -name "*strip" 2>/dev/null | head -n 1 || true)
+    if [[ -z "$arm_strip" || ! -x "$arm_strip" ]]; then
+        arm_strip="${toolchain_dir}/bin/arm-linux-strip"
+    fi
 
     if [[ ! -x "$arm_gcc" ]]; then
         info "Downloading standalone ARM musl cross-compiler..."
         mkdir -p "$toolchain_dir"
         curl -s -L "https://toolchains.bootlin.com/downloads/releases/toolchains/armv5-eabi/tarballs/armv5-eabi--musl--stable-2024.05-1.tar.xz" | \
             tar -xJ -C "$toolchain_dir" --strip-components=1
+        arm_gcc=$(find "${toolchain_dir}/bin" -name "*gcc*.br_real" 2>/dev/null | head -n 1 || true)
+        arm_strip=$(find "${toolchain_dir}/bin" -name "*strip" 2>/dev/null | head -n 1 || true)
         ok "ARM toolchain ready."
     fi
 
@@ -442,7 +519,7 @@ start_daemon() {
 
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         info "Starting Bluetooth AudioReceiver daemon on phone..."
-        adb shell "sh -c 'export ANDROID_DATA=/data/local/tmp; export CLASSPATH=${REMOTE_BT_JAR}; nohup app_process /system/bin --nice-name=audioarch_bt_daemon com.audioarch.AudioReceiver ${PORT} ${SAMPLE_RATE} > ${REMOTE_BT_LOG} 2>&1 &'"
+        adb shell "sh -c 'export ANDROID_DATA=/data/local/tmp; export CLASSPATH=${REMOTE_BT_JAR}; nohup app_process /system/bin --nice-name=audioarch_bt_daemon com.audioarch.AudioReceiver ${PORT} ${SAMPLE_RATE} ${CTRL_PORT} > ${REMOTE_BT_LOG} 2>&1 &'"
         sleep 1
         if ! is_daemon_running; then
             err "Failed to start Bluetooth AudioReceiver on phone. Logs:"
@@ -481,6 +558,153 @@ stop_daemon() {
         ok "No audio daemon was running."
     fi
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
+    adb forward --remove "tcp:${CTRL_PORT}" 2>/dev/null || true
+}
+
+INSTALL_DIR="${HOME}/.audioarch"
+
+install_service() {
+    info "Installing AudioArch into self-contained directory: ${CYAN}${INSTALL_DIR}${NC}..."
+
+    # Ensure receiver daemons are compiled
+    if [[ ! -f "${LOCAL_BT_JAR}" || ! -f "${LOCAL_C_BIN}" ]]; then
+        build_all
+    fi
+
+    # Create self-contained directory structure
+    mkdir -p "${INSTALL_DIR}/bin" "${INSTALL_DIR}/build" "${INSTALL_DIR}/src"
+
+    # Copy service daemon, receiver binaries, scripts, and runtime helpers
+    cp -f "${SCRIPT_DIR}/bin/audioarch-service" "${INSTALL_DIR}/bin/audioarch-service"
+    chmod +x "${INSTALL_DIR}/bin/audioarch-service"
+
+    cp -f "${LOCAL_BT_JAR}" "${INSTALL_DIR}/build/"
+    cp -f "${LOCAL_C_BIN}" "${INSTALL_DIR}/build/"
+
+    cp -f "${SRC_DIR}/audioarch_tray.py" "${INSTALL_DIR}/src/"
+    cp -f "${SRC_DIR}/fast_sender.py" "${INSTALL_DIR}/src/"
+    chmod +x "${INSTALL_DIR}/src/audioarch_tray.py"
+
+    cp -f "${SCRIPT_DIR}/audio_arch.sh" "${INSTALL_DIR}/audio_arch.sh"
+    chmod +x "${INSTALL_DIR}/audio_arch.sh"
+
+    # Global CLI shortcut in ~/.local/bin/audioarch
+    mkdir -p "${HOME}/.local/bin"
+    ln -sf "${INSTALL_DIR}/audio_arch.sh" "${HOME}/.local/bin/audioarch"
+
+    # Install Systemd User Unit pointing to ~/.audioarch
+    local service_dir="${HOME}/.config/systemd/user"
+    local unit_file="${service_dir}/audioarch.service"
+    mkdir -p "$service_dir"
+
+    cat << EOF > "$unit_file"
+[Unit]
+Description=Audio Arch - Ultra-Low Latency USB Audio & Bluetooth Bridge
+After=pipewire.service wireplumber.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/bin/audioarch-service
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable audioarch.service
+    ok "AudioArch installed to: ${CYAN}${INSTALL_DIR}${NC}"
+    ok "Systemd user service installed & enabled: ${CYAN}${unit_file}${NC}"
+    ok "CLI shortcut created: ${CYAN}~/.local/bin/audioarch${NC}"
+    echo ""
+    info "AudioArch is fully installed and self-contained! Commands:"
+    info "  Start:   audioarch start   (or: systemctl --user start audioarch)"
+    info "  Stop:    audioarch stop    (or: systemctl --user stop audioarch)"
+    info "  Status:  audioarch status"
+    info "  Battery: audioarch battery"
+}
+
+uninstall_service() {
+    info "Stopping and disabling AudioArch systemd user service..."
+    systemctl --user stop audioarch.service 2>/dev/null || true
+    systemctl --user disable audioarch.service 2>/dev/null || true
+    rm -f "${HOME}/.config/systemd/user/audioarch.service"
+    systemctl --user daemon-reload
+
+    info "Removing installed files from ${INSTALL_DIR}..."
+    rm -rf "${INSTALL_DIR}"
+    rm -f "${HOME}/.local/bin/audioarch"
+    ok "AudioArch service and installation uninstalled completely."
+}
+
+start_service() {
+    if [[ -S "${IPC_SOCKET}" ]]; then
+        ok "AudioArch service is already running."
+        send_ipc status || true
+        return 0
+    fi
+
+    if systemctl --user list-unit-files | grep -q "audioarch.service"; then
+        info "Starting audioarch systemd user service..."
+        systemctl --user start audioarch.service
+        sleep 1.5
+        if [[ -S "${IPC_SOCKET}" ]]; then
+            ok "AudioArch background service started successfully."
+            send_ipc status || true
+        else
+            warn "Service starting... check: systemctl --user status audioarch"
+        fi
+    else
+        info "Starting AudioArch service daemon in background..."
+        "${SCRIPT_DIR}/bin/audioarch-service" >/dev/null 2>&1 &
+        sleep 1.5
+        if [[ -S "${IPC_SOCKET}" ]]; then
+            ok "AudioArch background service started (PID: $!)."
+        fi
+    fi
+}
+
+stop_service() {
+    local stopped=false
+    if [[ -S "${IPC_SOCKET}" ]]; then
+        info "Sending stop command to running AudioArch service..."
+        send_ipc stop && stopped=true
+    fi
+    systemctl --user stop audioarch.service 2>/dev/null || true
+    ok "AudioArch service stopped. Desktop audio restored."
+}
+
+show_status() {
+    if [[ -S "${IPC_SOCKET}" ]]; then
+        info "AudioArch Background Service is ${GREEN}ACTIVE${NC}."
+        echo ""
+        send_ipc status
+        return 0
+    fi
+    check_status
+}
+
+show_battery() {
+    if [[ -S "${IPC_SOCKET}" ]]; then
+        send_ipc battery
+        return 0
+    fi
+    check_device
+    local bt_bat
+    bt_bat=$(adb shell "cat /data/local/tmp/audioarch_bt_battery 2>/dev/null" | head -n 1 | tr -d '\r\n')
+    local phone_bat
+    phone_bat=$(adb shell "cat /sys/class/power_supply/battery/capacity 2>/dev/null" | tr -d '\r\n')
+    if [[ -n "$bt_bat" ]]; then
+        ok "Bluetooth Earbuds: ${GREEN}${BT_DEVICE_NAME:-Redmi Buds}${NC} — Battery: ${CYAN}${bt_bat}%${NC}"
+    else
+        info "Bluetooth Earbuds: Battery not yet reported by headset."
+    fi
+    if [[ -n "$phone_bat" ]]; then
+        info "Phone Battery: ${CYAN}${phone_bat}%${NC}"
+    fi
 }
 
 check_status() {
@@ -555,6 +779,7 @@ cleanup() {
     fi
 
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
+    adb forward --remove "tcp:${CTRL_PORT}" 2>/dev/null || true
 
     if [[ -n "${ORIG_SINK}" ]]; then
         info "Restoring default audio sink: ${ORIG_SINK}"
@@ -583,12 +808,54 @@ cleanup() {
 check_dependencies
 
 case "${ACTION}" in
-    build)
-        build_all
+    install-service)
+        install_service
+        exit 0
+        ;;
+    uninstall-service)
+        uninstall_service
+        exit 0
+        ;;
+    start)
+        start_service
+        exit 0
+        ;;
+    stop)
+        stop_service
         exit 0
         ;;
     status)
-        check_status
+        show_status
+        exit 0
+        ;;
+    battery)
+        show_battery
+        exit 0
+        ;;
+    play-pause|next|prev)
+        if ! send_ipc "${ACTION}"; then
+            python3 -c "
+import subprocess
+action = '${ACTION}'
+try:
+    subprocess.run(['playerctl', action], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception:
+    method = {'play-pause':'PlayPause', 'next':'Next', 'prev':'Previous'}.get(action)
+    subprocess.run(['busctl', '--user', 'call', 'org.mpris.MediaPlayer2.player', '/org/mpris/MediaPlayer2', 'org.mpris.MediaPlayer2.Player', method], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+"
+        fi
+        exit 0
+        ;;
+    volume)
+        if ! send_ipc "volume ${SUB_ARG}"; then
+            step="+5%"
+            [[ "${SUB_ARG}" == "down" ]] && step="-5%"
+            wpctl set-volume @DEFAULT_AUDIO_SINK@ "${step}" 2>/dev/null || pactl set-sink-volume @DEFAULT_SINK@ "${step}" 2>/dev/null || true
+        fi
+        exit 0
+        ;;
+    build)
+        build_all
         exit 0
         ;;
     test)
@@ -608,9 +875,10 @@ check_device
 deploy_receiver
 ensure_daemon_running
 
-info "Mapping USB TCP port ${PORT} -> phone:${PORT}..."
+info "Mapping USB TCP ports (${PORT} audio, ${CTRL_PORT} control) -> phone..."
 adb forward "tcp:${PORT}" "tcp:${PORT}"
-ok "Port mapped."
+adb forward "tcp:${CTRL_PORT}" "tcp:${CTRL_PORT}"
+ok "Ports mapped."
 
 # Verify receiver listener socket
 if ! adb shell "netstat -an 2>/dev/null | grep -E '12345.*LISTEN'" &>/dev/null; then

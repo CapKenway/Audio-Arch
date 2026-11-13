@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""
+AudioArch Background Service Daemon
+Maintains the PipeWire null-sink, low-latency audio stream, ADB tunnel,
+bidirectional telemetry/remote-control channel, and KDE integration.
+"""
+
+import os
+import sys
+import time
+import json
+import socket
+import signal
+import select
+import threading
+import subprocess
+
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.join(SCRIPT_DIR, "src")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+IPC_SOCKET = os.path.join(RUNTIME_DIR, "audioarch.sock")
+STATE_FILE = os.path.join(RUNTIME_DIR, "audioarch.state")
+
+AUDIO_PORT = 12345
+CTRL_PORT = 12346
+SAMPLE_RATE = 44100
+CHANNELS = 2
+SINK_NAME = "AudioArch-Sink"
+SINK_DESC = "Android Phone Audio Card"
+
+state = {
+    "status": "starting",
+    "mode": "Bluetooth",
+    "bt_device": "Bluetooth Earbuds",
+    "bt_battery": -1,
+    "phone_battery": -1,
+    "latency_ms": 15,
+    "audio_pid": None,
+    "service_pid": os.getpid()
+}
+
+running = True
+orig_sink = None
+sink_module_id = None
+audio_proc = None
+tray_proc = None
+
+def save_state():
+    try:
+        with open(STATE_FILE + ".tmp", "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    except Exception:
+        pass
+
+def dispatch_mpris(action):
+    """Dispatches media commands to active desktop media players (Spotify, Firefox, VLC, Chrome)."""
+    # Try playerctl first if installed
+    try:
+        if action == "play-pause":
+            res = subprocess.run(["playerctl", "play-pause"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0: return
+        elif action == "next":
+            res = subprocess.run(["playerctl", "next"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0: return
+        elif action == "prev":
+            res = subprocess.run(["playerctl", "previous"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0: return
+    except Exception:
+        pass
+
+    # Direct D-Bus MPRIS fallback via busctl
+    method_map = {
+        "play-pause": "PlayPause",
+        "next": "Next",
+        "prev": "Previous"
+    }
+    method = method_map.get(action)
+    if not method: return
+
+    try:
+        # Find active MPRIS players on the session bus
+        out = subprocess.check_output(["busctl", "--user", "list", "--no-legend"], text=True)
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and parts[0].startswith("org.mpris.MediaPlayer2."):
+                bus_name = parts[0]
+                subprocess.run([
+                    "busctl", "--user", "call",
+                    bus_name,
+                    "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Player",
+                    method
+                ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+    except Exception:
+        pass
+
+def dispatch_volume(direction):
+    """Adjusts desktop audio volume via wpctl or pactl."""
+    try:
+        if direction == "up":
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif direction == "down":
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        step = "+5%" if direction == "up" else "-5%"
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", step],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def setup_pipewire_sink():
+    global orig_sink, sink_module_id
+    try:
+        orig_sink = subprocess.check_output(
+            ["pactl", "get-default-sink"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:
+        orig_sink = None
+
+    # Unload any existing duplicate module
+    try:
+        modules = subprocess.check_output(["pactl", "list", "modules", "short"], text=True).splitlines()
+        for mod in modules:
+            if SINK_NAME in mod:
+                mid = mod.split()[0]
+                subprocess.run(["pactl", "unload-module", mid], check=False)
+    except Exception:
+        pass
+
+    try:
+        latency = state.get("latency_ms", 15)
+        out = subprocess.check_output([
+            "pactl", "load-module", "module-null-sink",
+            f"sink_name={SINK_NAME}",
+            f"rate={SAMPLE_RATE}",
+            f"channels={CHANNELS}",
+            f"sink_properties=device.description='{SINK_DESC}' node.latency=128/{SAMPLE_RATE}"
+        ], text=True).strip()
+        sink_module_id = out
+        subprocess.run(["pactl", "set-default-sink", SINK_NAME], check=False)
+        print(f"[Service] Virtual sink created (Module ID: {sink_module_id}). Default sink redirected.")
+    except Exception as e:
+        print(f"[Service] Warning: Failed to create null-sink: {e}")
+
+def cleanup(sig=None, frame=None):
+    global running, sink_module_id, orig_sink, audio_proc, tray_proc
+    if not running: return
+    running = False
+    print("\n[Service] Shutting down audio pipeline and services...")
+
+    if audio_proc:
+        try: audio_proc.terminate(); audio_proc.wait(timeout=1)
+        except Exception: audio_proc.kill()
+
+    if tray_proc:
+        try: tray_proc.terminate()
+        except Exception: pass
+
+    # Restore default sink
+    if orig_sink:
+        print(f"[Service] Restoring original default audio sink: {orig_sink}")
+        subprocess.run(["pactl", "set-default-sink", orig_sink], check=False)
+
+    if sink_module_id:
+        print(f"[Service] Unloading virtual sink ({sink_module_id})...")
+        subprocess.run(["pactl", "unload-module", sink_module_id], check=False)
+
+    # Clean IPC files
+    for p in [IPC_SOCKET, STATE_FILE]:
+        try:
+            if os.path.exists(p): os.remove(p)
+        except Exception: pass
+
+    subprocess.run(["adb", "forward", "--remove", f"tcp:{AUDIO_PORT}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["adb", "forward", "--remove", f"tcp:{CTRL_PORT}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("[Service] Clean shutdown complete.")
+    sys.exit(0)
+
+def control_client_thread():
+    """Connects to Android phone control port 12346 to receive telemetry and media events."""
+    global running, state
+    while running:
+        s = None
+        try:
+            s = socket.create_connection(("127.0.0.1", CTRL_PORT), timeout=5)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            f = s.makefile("r")
+            # Request current battery
+            s.sendall(b"GET_BATTERY\n")
+
+            while running:
+                line = f.readline()
+                if not line: break
+                line = line.strip()
+                if not line: continue
+
+                if line.startswith("BATTERY:"):
+                    # Format: BATTERY:<pct>:<deviceName>
+                    parts = line.split(":", 2)
+                    if len(parts) >= 2:
+                        try:
+                            state["bt_battery"] = int(parts[1])
+                            if len(parts) >= 3 and parts[2]:
+                                state["bt_device"] = parts[2]
+                            save_state()
+                            print(f"[Control] Telemetry update: {state['bt_device']} Battery = {state['bt_battery']}%")
+                        except ValueError: pass
+                elif line.startswith("PHONE_BATTERY:"):
+                    parts = line.split(":", 1)
+                    if len(parts) >= 2:
+                        try:
+                            state["phone_battery"] = int(parts[1])
+                            save_state()
+                        except ValueError: pass
+                elif line.startswith("MEDIA:"):
+                    # Media control event from Bluetooth earbuds or phone hardware keys!
+                    ev = line[6:]
+                    print(f"[RemoteControl] Received remote earbud action: {ev}")
+                    if ev == "PLAY_PAUSE":
+                        dispatch_mpris("play-pause")
+                    elif ev == "NEXT":
+                        dispatch_mpris("next")
+                    elif ev == "PREV":
+                        dispatch_mpris("prev")
+                    elif ev == "VOL_UP":
+                        dispatch_volume("up")
+                    elif ev == "VOL_DOWN":
+                        dispatch_volume("down")
+        except Exception:
+            pass
+        finally:
+            if s:
+                try: s.close()
+                except Exception: pass
+        if running:
+            time.sleep(2)
+
+def audio_streamer_thread():
+    """Supervises the parec -> fast_sender pipeline."""
+    global running, audio_proc
+    fast_sender_path = os.path.join(SRC_DIR, "fast_sender.py")
+
+    while running:
+        try:
+            # Check if phone daemon is responsive
+            subprocess.run(["adb", "forward", f"tcp:{AUDIO_PORT}", f"tcp:{AUDIO_PORT}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["adb", "forward", f"tcp:{CTRL_PORT}", f"tcp:{CTRL_PORT}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            latency_ms = str(state.get("latency_ms", 15))
+            env = os.environ.copy()
+            env["PIPEWIRE_LATENCY"] = f"128/{SAMPLE_RATE}"
+            env["PULSE_LATENCY_MSEC"] = latency_ms
+
+            parec_cmd = [
+                "parec", "--raw",
+                "-d", f"{SINK_NAME}.monitor",
+                "--format=s16le",
+                f"--rate={SAMPLE_RATE}",
+                f"--channels={CHANNELS}",
+                f"--latency-msec={latency_ms}",
+                f"--process-time-msec={latency_ms}"
+            ]
+            sender_cmd = [sys.executable, fast_sender_path, str(AUDIO_PORT)]
+
+            p1 = subprocess.Popen(parec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+            p2 = subprocess.Popen(sender_cmd, stdin=p1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p1.stdout.close()
+            audio_proc = p2
+            state["audio_pid"] = p2.pid
+            state["status"] = "streaming"
+            save_state()
+
+            p2.wait()
+        except Exception as e:
+            time.sleep(1)
+        if running:
+            time.sleep(1)
+
+def ipc_server_thread():
+    """Listens on local Unix domain socket for CLI client commands."""
+    global running, state
+    if os.path.exists(IPC_SOCKET):
+        try: os.remove(IPC_SOCKET)
+        except Exception: pass
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(IPC_SOCKET)
+    server.listen(5)
+    server.settimeout(1.0)
+
+    while running:
+        try:
+            client, _ = server.accept()
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+
+        def handle_client(c):
+            try:
+                data = c.recv(1024).decode().strip()
+                cmd = data.split()
+                if not cmd: return
+                action = cmd[0].lower()
+
+                if action == "status":
+                    c.sendall(json.dumps(state, indent=2).encode() + b"\n")
+                elif action == "battery":
+                    bt = state.get("bt_battery", -1)
+                    dev = state.get("bt_device", "Bluetooth Headset")
+                    pb = state.get("phone_battery", -1)
+                    resp = f"Headset: {dev} ({bt}%)\nPhone: {pb}%\n" if bt >= 0 else f"Headset: Detecting...\nPhone: {pb}%\n"
+                    c.sendall(resp.encode())
+                elif action == "play-pause":
+                    dispatch_mpris("play-pause")
+                    c.sendall(b"OK: play-pause dispatched\n")
+                elif action == "next":
+                    dispatch_mpris("next")
+                    c.sendall(b"OK: next track dispatched\n")
+                elif action == "prev":
+                    dispatch_mpris("prev")
+                    c.sendall(b"OK: prev track dispatched\n")
+                elif action == "volume":
+                    arg = cmd[1] if len(cmd) > 1 else "up"
+                    dispatch_volume(arg)
+                    c.sendall(f"OK: volume {arg} dispatched\n".encode())
+                elif action == "stop":
+                    c.sendall(b"OK: stopping service\n")
+                    c.close()
+                    cleanup()
+                else:
+                    c.sendall(b"ERR: unknown command\n")
+            except Exception:
+                pass
+            finally:
+                try: c.close()
+                except Exception: pass
+
+        t = threading.Thread(target=handle_client, args=(client,))
+        t.daemon = True
+        t.start()
+
+    try: server.close()
+    except Exception: pass
+
+def main():
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGHUP, cleanup)
+
+    print(f"[Service] Starting AudioArch background service (PID: {os.getpid()})...")
+
+    # Ensure phone daemon is deployed and active
+    setup_script = os.path.join(SCRIPT_DIR, "audio_arch.sh")
+    try:
+        subprocess.run([setup_script, "--status"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    setup_pipewire_sink()
+
+    # Start KDE Plasma system tray icon if available
+    global tray_proc
+    tray_script = os.path.join(SRC_DIR, "audioarch_tray.py")
+    if os.path.exists(tray_script) and "WAYLAND_DISPLAY" in os.environ or "DISPLAY" in os.environ:
+        try:
+            tray_proc = subprocess.Popen([sys.executable, tray_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("[Service] KDE Plasma System Tray applet started.")
+        except Exception:
+            pass
+
+    # Launch worker threads
+    t_ctrl = threading.Thread(target=control_client_thread, daemon=True, name="ControlClientThread")
+    t_ipc = threading.Thread(target=ipc_server_thread, daemon=True, name="IPCServerThread")
+    t_audio = threading.Thread(target=audio_streamer_thread, daemon=True, name="AudioStreamerThread")
+
+    t_ctrl.start()
+    t_ipc.start()
+    t_audio.start()
+
+    save_state()
+    print("[Service] AudioArch Service is ACTIVE and streaming. Ready for CLI and earbud controls.")
+
+    while running:
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
+

@@ -10,6 +10,9 @@ Audio Arch operates completely offline over a physical USB cable using ADB port 
 
 - **Extreme Low-End Android Support**: Designed specifically to run smoothly on legacy single-core hardware (tested on Samsung Galaxy Pocket Neo / Star `GT-S5282` with an 850MHz CPU and 512MB RAM).
 - **Zero-APK Architecture**: No sideloading or Google Play Store apps required. Runs directly out of `/data/local/tmp` via native static C binaries and Dalvik's built-in `app_process`.
+- **2-Part Client/Service Architecture**: Run headlessly in the background as a `systemd --user` service with an instant CLI controller (`audio_arch.sh`) communicating via local Unix domain socket IPC (`$XDG_RUNTIME_DIR/audioarch.sock`). Installable directly from the CLI with `./audio_arch.sh --install-service`.
+- **Bluetooth Earbud Battery & KDE Plasma Integration**: Automatically extracts Bluetooth battery telemetry via an integrated Java AT listener supporting virtually all TWS models (Xiaomi, Apple/Beats, Anker Soundcore, Sony, JBL, Galaxy Buds). Integrates natively into KDE Plasma's System Tray (via StatusNotifierItem) with live battery %, tooltips, and desktop notifications.
+- **Bi-Directional Remote Control**: Intercepts Bluetooth earbud taps (AVRCP input events) and phone volume keys, seamlessly controlling active desktop media players (Spotify, Firefox, VLC via MPRIS) and desktop volume (`wpctl`).
 - **Dual-Backend Routing**:
   - **Native C ALSA Backend**: Direct kernel ALSA playback (`/dev/snd/pcmC0D0p`) via TinyALSA for ~23ms latency through the phone's 3.5mm headphone jack or internal speaker (<0.1% CPU, ~80 KB RAM).
   - **Bluetooth AudioTrack Backend**: Java receiver interacting with Android's `AudioTrack` and `AudioPolicyManager` to stream desktop audio to connected Bluetooth earbuds (e.g., Redmi Buds, AirPods, Galaxy Buds).
@@ -80,41 +83,62 @@ sudo pacman -S android-tools pipewire-pulse libpulse python ffmpeg
 
 ## Quick Usage
 
-### 1. Start Streaming Desktop Audio
+### 1. Interactive Streaming
 ```bash
 ./audio_arch.sh
 ```
-Automatically detects your Bluetooth earbuds or 3.5mm jack and begins streaming. Press `Ctrl+C` at any time to disconnect cleanly and restore your PC's original audio output.
+Automatically detects your Bluetooth earbuds or 3.5mm jack and begins streaming in the foreground. Press `Ctrl+C` to disconnect cleanly and restore PC desktop sound.
 
-### 2. Send a 1-Second Test Chime
+### 2. Background Systemd Service (Recommended)
+Install Audio Arch as a fully self-contained background user service into `~/.audioarch` (independent of where the repository was cloned):
+```bash
+# Install self-contained service and create global ~/.local/bin/audioarch command
+./audio_arch.sh --install-service
+
+# Control the service from anywhere in the terminal
+audioarch start
+audioarch status
+audioarch battery
+audioarch stop
+```
+When running as a service, Audio Arch adds a headset icon to your KDE Plasma system tray showing live battery %, desktop notifications on connect, and listens for earbud taps to control music playback.
+
+### 3. Media & Volume Control via Earbuds & CLI
+- **Earbud Taps**: Single tap for Play/Pause, double tap for Next Track, triple tap for Previous Track.
+- **CLI Commands**:
+  ```bash
+  ./audio_arch.sh play-pause
+  ./audio_arch.sh next
+  ./audio_arch.sh prev
+  ./audio_arch.sh volume up
+  ./audio_arch.sh volume down
+  ```
+
+### 4. Send a 1-Second Test Chime
 ```bash
 ./audio_arch.sh --test
 ```
-Generates and plays a quick audio chime to confirm you can hear sound through your phone or Bluetooth earbuds.
-
-### 3. Check System & Link Status
-```bash
-./audio_arch.sh --status
-```
-Displays device model, Android version, active Bluetooth connections, ADB port forwards, and daemon status.
-
-### 4. Stop Background Phone Daemon
-```bash
-./audio_arch.sh --kill-daemon
-```
-Terminates any background daemons running on the phone and cleans up port forwards.
+Plays a quick audio chime to confirm you can hear sound through your phone or Bluetooth earbuds.
 
 ---
 
 ## Command-Line Options
 
-| Option | Description |
+| Command / Option | Description |
 |---|---|
-| *(no args)* | Auto-detect output and start low-latency audio stream |
+| *(no args)* | Auto-detect output and start low-latency audio stream in foreground |
+| `--install-service` | Install and enable systemd user service (`audioarch.service`) |
+| `--uninstall-service` | Uninstall and disable systemd user service |
+| `start` | Start background audio service (via systemd or daemon) |
+| `stop` | Stop audio service and restore desktop sound |
+| `status`, `--status` | Query running service or phone status, battery, and mode |
+| `battery`, `--battery` | Query current Bluetooth earbud and phone battery levels |
+| `play-pause` | Toggle play/pause on active desktop media players (MPRIS) |
+| `next`, `prev` | Skip track forward / backward on desktop media players |
+| `volume <up\|down>` | Adjust desktop audio volume |
 | `--bt`, `--bluetooth` | Force routing through Bluetooth AudioTrack backend |
 | `--alsa`, `--c` | Force routing through Native C ALSA backend (3.5mm jack / speaker) |
 | `--test` | Send a 1-second test audio chime to verify sound |
-| `--status` | Check connection state, daemon version, and running process info |
 | `--restart` | Force restart the audio daemon on the phone |
 | `--force-deploy` | Force re-deploying daemon files to the phone even if version matches |
 | `--kill-daemon` | Stop running audio daemons on the phone |
