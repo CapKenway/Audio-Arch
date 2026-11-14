@@ -403,6 +403,7 @@ def control_client_thread():
                                 print("[Control] Telemetry update: Headset Disconnected (No device connected)")
                         except ValueError: pass
                 elif line.startswith("PHONE_BATTERY:"):
+                    
                     parts = line.split(":", 1)
                     if len(parts) >= 2:
                         try:
