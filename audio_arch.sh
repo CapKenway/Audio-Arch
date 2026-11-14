@@ -22,7 +22,7 @@ SRC_DIR="${SCRIPT_DIR}/src"
 MODE="auto" # "auto", "bt", or "alsa"
 ACTIVE_BACKEND="alsa"
 BT_DEVICE_NAME=""
-DAEMON_VERSION="2.0"
+DAEMON_VERSION="2.2"
 REMOTE_VER_FILE="/data/local/tmp/audioarch_version"
 FORCE_DEPLOY=false
 FORCE_RESTART=false
@@ -145,7 +145,7 @@ send_ipc() {
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
-    s.settimeout(2.0)
+    s.settimeout(5.0)
     s.connect('${IPC_SOCKET}')
     s.sendall(('$cmd\n').encode())
     res = s.recv(4096).decode()
@@ -260,6 +260,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --force-deploy)
+            ACTION="force-deploy"
             FORCE_DEPLOY=true
             shift
             ;;
@@ -588,8 +589,15 @@ start_daemon() {
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         info "Starting Bluetooth AudioReceiver daemon on phone..."
         adb shell "sh -c 'export ANDROID_DATA=/data/local/tmp; export CLASSPATH=${REMOTE_BT_JAR}; nohup app_process /system/bin --nice-name=audioarch_bt_daemon com.audioarch.AudioReceiver ${PORT} ${SAMPLE_RATE} ${CTRL_PORT} > ${REMOTE_BT_LOG} 2>&1 &'"
-        sleep 1
-        if ! is_daemon_running; then
+        local started=false
+        for retry in 1 2 3 4 5 6; do
+            sleep 0.5
+            if is_daemon_running; then
+                started=true
+                break
+            fi
+        done
+        if [[ "$started" == "false" ]]; then
             err "Failed to start Bluetooth AudioReceiver on phone. Logs:"
             adb shell "cat ${REMOTE_BT_LOG}" 2>/dev/null || true
             exit 1
@@ -982,6 +990,15 @@ cleanup() {
     exit 0
 }
 
+is_daemon_listening() {
+    adb shell netstat -an 2>/dev/null | grep "${PORT}" | grep -q "LISTEN"
+}
+
+ensure_port_forward() {
+    adb forward "tcp:${PORT}" "tcp:${PORT}" >/dev/null 2>&1 || true
+    adb forward "tcp:${CTRL_PORT}" "tcp:${CTRL_PORT}" >/dev/null 2>&1 || true
+}
+
 # ------------------------------------------------------------------------------
 # Main Flow
 # ------------------------------------------------------------------------------
@@ -1054,6 +1071,18 @@ except Exception:
         ensure_port_forward
         exit 0
         ;;
+    force-deploy)
+        check_device
+        deploy_receiver
+        ensure_daemon_running
+        ensure_port_forward
+        if is_service_running; then
+            info "Restarting background service to reconnect to newly deployed daemon..."
+            systemctl --user restart audioarch.service 2>/dev/null || true
+        fi
+        ok "Daemon forcefully deployed and running on phone (v${DAEMON_VERSION})."
+        exit 0
+        ;;
     run)
         ;;
 esac
@@ -1088,15 +1117,6 @@ if [[ "$ACTION" == "run" ]]; then
         fi
     fi
 fi
-
-is_daemon_listening() {
-    adb shell netstat -an 2>/dev/null | grep "${PORT}" | grep -q "LISTEN"
-}
-
-ensure_port_forward() {
-    adb forward "tcp:${PORT}" "tcp:${PORT}" >/dev/null 2>&1 || true
-    adb forward "tcp:${CTRL_PORT}" "tcp:${CTRL_PORT}" >/dev/null 2>&1 || true
-}
 
 check_device
 deploy_receiver

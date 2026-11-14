@@ -28,7 +28,7 @@ CTRL_PORT = 12346
 SAMPLE_RATE = 44100
 CHANNELS = 2
 SINK_NAME = "AudioArch-Sink"
-DAEMON_VERSION = "2.0"
+DAEMON_VERSION = "2.2"
 
 state = {
     "status": "waiting_for_device",
@@ -590,51 +590,52 @@ def ipc_server_thread():
                         c.sendall(f"Current polling interval: {state.get('poll_interval', 30)}s\n".encode())
                     return
                 elif action in ["battery", "recheck", "refresh"]:
-                    try:
-                        s_ctrl = socket.create_connection(("127.0.0.1", CTRL_PORT), timeout=2)
-                        s_ctrl.sendall(b"FORCE_RECHECK\n")
-                        s_ctrl.settimeout(3.0)
-                        f_ctrl = s_ctrl.makefile("r")
-                        while True:
-                            l = f_ctrl.readline()
-                            if not l or "RECHECK_COMPLETE" in l: break
-                            l = l.strip()
-                            if l.startswith("DEVICE:"):
-                                d = l[7:].strip()
-                                if d and d.lower() not in ["waiting for phone...", "none", "null"]:
-                                    state["bt_device"] = d
-                            elif l.startswith("BATTERY:") or l.startswith("BATTERY|"):
-                                sep = "|" if "|" in l else ":"
-                                parts = l.split(sep, 5)
-                                if len(parts) >= 2:
-                                    try:
-                                        b_val = int(parts[1])
-                                        if b_val < 0:
-                                            state["bt_device"] = "Disconnected"
-                                            state["bt_battery"] = -1
-                                            state["bt_battery_source"] = "disconnected"
-                                            state["bt_battery_time"] = ""
-                                            state["bt_battery_details"] = ""
-                                        else:
-                                            state["bt_battery"] = b_val
-                                    except ValueError: pass
-                                if len(parts) >= 3 and parts[2].strip() and parts[2].strip().lower() not in ["null", "none"]:
-                                    state["bt_device"] = parts[2].strip()
-                                if len(parts) >= 4 and parts[3].strip():
-                                    state["bt_battery_source"] = parts[3].strip()
-                                state["bt_battery_time"] = time.strftime("%H:%M:%S") if state.get("bt_battery_source") == "live" else (parts[4].strip() if len(parts) >= 5 else "")
-                                if len(parts) >= 6 and parts[5].strip():
-                                    state["bt_battery_details"] = parts[5].strip()
-                            elif l.startswith("PHONE_BATTERY:"):
-                                parts = l.split(":", 1)
-                                if len(parts) >= 2:
-                                    try: state["phone_battery"] = int(parts[1])
-                                    except ValueError: pass
-                        s_ctrl.close()
-                    except Exception:
-                        query_device_telemetry()
-
-                    save_state()
+                    force = action in ["recheck", "refresh"] or (len(cmd) >= 2 and cmd[1] in ["--force", "-f", "--recheck"])
+                    if force or state.get("bt_battery", -1) < 0:
+                        try:
+                            s_ctrl = socket.create_connection(("127.0.0.1", CTRL_PORT), timeout=2)
+                            s_ctrl.sendall(b"FORCE_RECHECK\n")
+                            s_ctrl.settimeout(5.0)
+                            f_ctrl = s_ctrl.makefile("r")
+                            while True:
+                                l = f_ctrl.readline()
+                                if not l or "RECHECK_COMPLETE" in l: break
+                                l = l.strip()
+                                if l.startswith("DEVICE:"):
+                                    d = l[7:].strip()
+                                    if d and d.lower() not in ["waiting for phone...", "none", "null"]:
+                                        state["bt_device"] = d
+                                elif l.startswith("BATTERY:") or l.startswith("BATTERY|"):
+                                    sep = "|" if "|" in l else ":"
+                                    parts = l.split(sep, 5)
+                                    if len(parts) >= 2:
+                                        try:
+                                            b_val = int(parts[1])
+                                            if b_val < 0:
+                                                state["bt_device"] = "Disconnected"
+                                                state["bt_battery"] = -1
+                                                state["bt_battery_source"] = "disconnected"
+                                                state["bt_battery_time"] = ""
+                                                state["bt_battery_details"] = ""
+                                            else:
+                                                state["bt_battery"] = b_val
+                                        except ValueError: pass
+                                    if len(parts) >= 3 and parts[2].strip() and parts[2].strip().lower() not in ["null", "none"]:
+                                        state["bt_device"] = parts[2].strip()
+                                    if len(parts) >= 4 and parts[3].strip():
+                                        state["bt_battery_source"] = parts[3].strip()
+                                    state["bt_battery_time"] = time.strftime("%H:%M:%S") if state.get("bt_battery_source") == "live" else (parts[4].strip() if len(parts) >= 5 else "")
+                                    if len(parts) >= 6 and parts[5].strip():
+                                        state["bt_battery_details"] = parts[5].strip()
+                                elif l.startswith("PHONE_BATTERY:"):
+                                    parts = l.split(":", 1)
+                                    if len(parts) >= 2:
+                                        try: state["phone_battery"] = int(parts[1])
+                                        except ValueError: pass
+                            s_ctrl.close()
+                        except Exception:
+                            query_device_telemetry()
+                        save_state()
                     bt = state.get("bt_battery", -1)
                     dev = state.get("bt_device", "Disconnected")
                     src = state.get("bt_battery_source", "disconnected")

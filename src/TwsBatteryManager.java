@@ -52,6 +52,7 @@ public class TwsBatteryManager {
     private final BluetoothAdapter btAdapter;
 
     private volatile HfpSocketWorker activeWorker;
+    private volatile BluetoothDevice currentDevice;
     private volatile boolean isRunning = false;
     private volatile int lastBatteryLevel = -1;
     private volatile boolean lastChargingState = false;
@@ -266,8 +267,26 @@ public class TwsBatteryManager {
     private synchronized void startWorkerForDevice(BluetoothDevice device) {
         if (!isRunning) return;
         stopActiveWorker();
+        this.currentDevice = device;
         activeWorker = new HfpSocketWorker(device);
         activeWorker.start();
+    }
+
+    public synchronized void forceReconnect() {
+        if (!isRunning) return;
+        BluetoothDevice dev = currentDevice;
+        if (dev == null && activeWorker != null) {
+            dev = activeWorker.device;
+        }
+        if (activeWorker != null) {
+            activeWorker.shutdown();
+            activeWorker = null;
+        }
+        if (dev != null) {
+            startWorkerForDevice(dev);
+        } else {
+            checkConnectedDevices();
+        }
     }
 
     public synchronized void stopActiveWorker() {
@@ -314,23 +333,19 @@ public class TwsBatteryManager {
 
         @Override
         public void run() {
-            // Brief initial delay so Bluedroid finishes releasing HFP if it was attached
-            sleepQuietly(700);
+            sleepQuietly(300);
 
-            int attempt = 0;
-            while (running && isRunning && attempt < 4) {
-                attempt++;
+            while (running && isRunning) {
                 BufferedReader reader = null;
                 OutputStream out = null;
                 try {
                     socket = openRfcommSocketWithFallback(device);
                     if (socket == null) {
-                        sleepQuietly(2000);
+                        sleepQuietly(2500);
                         continue;
                     }
 
                     Log.i(TAG, "Connected HFP battery socket to " + device.getName());
-                    // Small 256-byte buffer to minimize RAM overhead on 512MB device
                     reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "ASCII"), 256);
                     out = socket.getOutputStream();
 
@@ -343,8 +358,8 @@ public class TwsBatteryManager {
                     }
                 } catch (IOException e) {
                     if (running) {
-                        Log.d(TAG, "HFP socket closed or read error (attempt " + attempt + "): " + e.getMessage());
-                        sleepQuietly(2500);
+                        Log.d(TAG, "HFP battery socket refresh: " + e.getMessage());
+                        sleepQuietly(1500);
                     }
                 } finally {
                     closeQuietly(reader);
@@ -443,21 +458,21 @@ public class TwsBatteryManager {
             out.write(("\r\n" + response + "\r\n").getBytes("ASCII"));
             out.flush();
         }
+    }
 
-        private void sleepQuietly(long ms) {
-            try {
-                Thread.sleep(ms);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
         }
+    }
 
-        private void closeQuietly(Closeable c) {
-            if (c != null) {
-                try {
-                    c.close();
-                } catch (IOException ignored) {}
-            }
+    private static void closeQuietly(Closeable c) {
+        if (c != null) {
+            try {
+                c.close();
+            } catch (IOException ignored) {}
         }
     }
 }

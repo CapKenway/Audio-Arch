@@ -21,7 +21,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 public class AudioReceiver {
-    public static final String VERSION = "2.0";
+    public static final String VERSION = "2.2";
     private static final int DEFAULT_AUDIO_PORT = 12345;
     private static final int DEFAULT_CTRL_PORT = 12346;
     private static final int DEFAULT_SAMPLE_RATE = 44100;
@@ -99,11 +99,9 @@ public class AudioReceiver {
         if (line.startsWith("+")) line = line.substring(1);
         else if (line.startsWith("AT+")) line = line.substring(3);
 
-        // 1. Xiaomi Dynamic TLV Hex: +XIAOMI=FF... (e.g. +XIAOMI=FF0102010115000401027F14...)
-        if (line.contains("XIAOMI=") && line.matches(".*XIAOMI=[0-9A-Fa-f]{10,}.*")) {
-            int eq = line.indexOf("XIAOMI=");
-            String hex = line.substring(eq + "XIAOMI=".length()).trim();
-            BatteryInfo info = parseXiaomiHex(hex);
+        // 1. Xiaomi CSV State Packet: +XIAOMI=1,1,model,left,right,case,flags (e.g. +XIAOMI=1,1,80,228,228,100,1)
+        if (line.toUpperCase().contains("XIAOMI=")) {
+            BatteryInfo info = parseXiaomiCsv(line);
             if (info != null) return info;
         }
 
@@ -174,75 +172,86 @@ public class AudioReceiver {
         return null;
     }
 
-    public static BatteryInfo parseXiaomiHex(String hex) {
-        if (hex == null || hex.length() < 8) return null;
-        hex = hex.toUpperCase();
+    public static BatteryInfo parseXiaomiCsv(String line) {
+        if (line == null) return null;
+        int xIdx = line.toUpperCase().indexOf("XIAOMI=");
+        if (xIdx < 0) return null;
         try {
-            BatteryInfo info = null;
-            int idx = hex.indexOf("040102");
-            if (idx >= 0 && idx + 10 <= hex.length()) {
-                info = extractXiaomiBudsBattery(hex.substring(idx + 6, idx + 10));
+            String payload = line.substring(xIdx + "XIAOMI=".length()).trim();
+            // Discard proprietary binary frames starting with FF (e.g. FF01020101...)
+            if (payload.toUpperCase().startsWith("FF")) {
+                return null;
             }
-            if (info == null) {
-                idx = hex.indexOf("040002");
-                if (idx >= 0 && idx + 10 <= hex.length()) {
-                    info = extractXiaomiBudsBattery(hex.substring(idx + 6, idx + 10));
-                }
+            String[] rawTokens = payload.split(",");
+            java.util.List<String> tokensList = new java.util.ArrayList<String>();
+            for (String t : rawTokens) {
+                String clean = t.trim();
+                if (!clean.isEmpty()) tokensList.add(clean);
             }
-            if (info == null) {
-                idx = hex.indexOf("0402");
-                if (idx >= 0 && idx + 8 <= hex.length()) {
-                    info = extractXiaomiBudsBattery(hex.substring(idx + 4, idx + 8));
-                }
+            if (tokensList.size() < 3) return null;
+
+            // Handshake/CSV format: +XIAOMI=1,1,model,left,right,case,flags
+            // or stripped format: model,left,right,case,flags
+            int offset = 0;
+            if (tokensList.size() >= 5 && "1".equals(tokensList.get(0)) && "1".equals(tokensList.get(1))) {
+                offset = 2;
             }
 
-            if (info != null) {
-                // Check optional Case battery: Tag 05 Sub 01 Len 01 (e.g. 0501011E)
-                int cIdx = hex.indexOf("050101");
-                if (cIdx >= 0 && cIdx + 8 <= hex.length()) {
-                    try {
-                        int cRaw = Integer.parseInt(hex.substring(cIdx + 6, cIdx + 8), 16);
-                        int cPct = cRaw & 0x7F;
-                        boolean cChg = (cRaw & 0x80) != 0;
-                        if (cPct >= 0 && cPct <= 100) {
-                            info.details += " Case:" + cPct + (cChg ? "%⚡" : "%");
-                        }
-                    } catch (Exception ignored) {}
-                }
+            int leftIdx = offset + 1;
+            int rightIdx = offset + 2;
+            int caseIdx = offset + 3;
+
+            if (tokensList.size() <= rightIdx) return null;
+
+            int leftRaw = Integer.parseInt(tokensList.get(leftIdx));
+            int rightRaw = Integer.parseInt(tokensList.get(rightIdx));
+            int leftPct = leftRaw & 0x7F;
+            boolean leftChg = (leftRaw & 0x80) != 0;
+            int rightPct = rightRaw & 0x7F;
+            boolean rightChg = (rightRaw & 0x80) != 0;
+
+            int casePct = -1;
+            boolean caseChg = false;
+            if (tokensList.size() > caseIdx) {
+                try {
+                    int caseRaw = Integer.parseInt(tokensList.get(caseIdx));
+                    int cPct = caseRaw & 0x7F;
+                    if (caseRaw != 127 && caseRaw != 255 && cPct >= 0 && cPct <= 100) {
+                        casePct = cPct;
+                        caseChg = (caseRaw & 0x80) != 0;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            boolean vLeft = (leftRaw != 127 && leftRaw != 255 && leftPct >= 0 && leftPct <= 100);
+            boolean vRight = (rightRaw != 127 && rightRaw != 255 && rightPct >= 0 && rightPct <= 100);
+
+            BatteryInfo info = new BatteryInfo();
+            if (vLeft && vRight) {
+                info.battery = Math.min(leftPct, rightPct);
+                info.isCharging = leftChg || rightChg;
+                info.details = "L:" + leftPct + (leftChg ? "%⚡" : "%") + " R:" + rightPct + (rightChg ? "%⚡" : "%");
+            } else if (vLeft) {
+                info.battery = leftPct;
+                info.isCharging = leftChg;
+                info.details = "L:" + leftPct + (leftChg ? "%⚡" : "%");
+            } else if (vRight) {
+                info.battery = rightPct;
+                info.isCharging = rightChg;
+                info.details = "R:" + rightPct + (rightChg ? "%⚡" : "%");
+            } else if (casePct >= 0) {
+                info.battery = casePct;
+                info.isCharging = caseChg;
+            }
+
+            if (casePct >= 0) {
+                info.details += (info.details.isEmpty() ? "" : " ") + "Case:" + casePct + (caseChg ? "%⚡" : "%");
+            }
+
+            if (info.battery >= 0) {
                 return info;
             }
         } catch (Exception ignored) {}
-        return null;
-    }
-
-    private static BatteryInfo extractXiaomiBudsBattery(String fourHex) {
-        int b1Raw = Integer.parseInt(fourHex.substring(0, 2), 16);
-        int b2Raw = Integer.parseInt(fourHex.substring(2, 4), 16);
-        int b1 = b1Raw & 0x7F;
-        boolean b1Chg = (b1Raw & 0x80) != 0;
-        int b2 = b2Raw & 0x7F;
-        boolean b2Chg = (b2Raw & 0x80) != 0;
-
-        boolean v1 = (b1 >= 0 && b1 <= 100);
-        boolean v2 = (b2 >= 0 && b2 <= 100);
-
-        BatteryInfo info = new BatteryInfo();
-        if (v1 && v2) {
-            info.battery = Math.min(b1, b2);
-            info.isCharging = b1Chg || b2Chg;
-            info.details = "L:" + b1 + (b1Chg ? "%⚡" : "%") + " R:" + b2 + (b2Chg ? "%⚡" : "%");
-            return info;
-        } else if (v1) {
-            info.battery = b1;
-            info.isCharging = b1Chg;
-            info.details = b1 + (b1Chg ? "%⚡" : "%");
-            return info;
-        } else if (v2) {
-            info.battery = b2;
-            info.isCharging = b2Chg;
-            info.details = b2 + (b2Chg ? "%⚡" : "%");
-            return info;
-        }
         return null;
     }
 
@@ -343,12 +352,21 @@ public class AudioReceiver {
         lastKnownBtDevice = curDev;
         if (batteryManager != null) {
             batteryManager.attachToDeviceByName(curDev);
-            batteryManager.checkConnectedDevices();
+            batteryManager.forceReconnect();
+            // Wait up to 1.5s for immediate live battery handshake from earbuds
+            for (int i = 0; i < 15; i++) {
+                try { Thread.sleep(100); } catch (Exception ignored) {}
+                if (batteryManager.getLastBatteryLevel() >= 0) {
+                    break;
+                }
+            }
         }
 
-        BatteryInfo logcatInfo = queryVendorAtFromLogcat();
-        if (logcatInfo != null && logcatInfo.battery >= 0) {
-            updateBatteryState(logcatInfo.battery, logcatInfo.isCharging, logcatInfo.details);
+        if (lastKnownBtBattery < 0) {
+            BatteryInfo logcatInfo = queryVendorAtFromLogcat();
+            if (logcatInfo != null && logcatInfo.battery >= 0) {
+                updateBatteryState(logcatInfo.battery, logcatInfo.isCharging, logcatInfo.details);
+            }
         }
 
         int pBat = readPhoneBattery();
