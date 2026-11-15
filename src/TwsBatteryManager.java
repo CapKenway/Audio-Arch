@@ -125,6 +125,32 @@ public class TwsBatteryManager {
 
         // Direct fallback: check bonded devices for connected headset
         checkConnectedDevices();
+        startInBandPingLoop();
+    }
+
+    private void startInBandPingLoop() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (isRunning) {
+                    sleepQuietly(60000); // 60s periodic in-band ping
+                    if (!isRunning) break;
+                    if (activeWorker != null && activeWorker.isAlive()) {
+                        Log.i(TAG, "Periodic in-band battery ping (+CIEV: 7, 5)...");
+                        pingInBand();
+                    }
+                }
+            }
+        }, "TwsBattery-InBandPing");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    public synchronized boolean pingInBand() {
+        if (activeWorker != null) {
+            return activeWorker.pingInBand();
+        }
+        return false;
     }
 
     /**
@@ -318,6 +344,7 @@ public class TwsBatteryManager {
         final BluetoothDevice device;
         private volatile boolean running = true;
         private volatile BluetoothSocket socket;
+        private volatile OutputStream activeOut;
 
         HfpSocketWorker(BluetoothDevice device) {
             super("TwsBattery-" + device.getAddress());
@@ -325,8 +352,21 @@ public class TwsBatteryManager {
             setDaemon(true);
         }
 
+        public synchronized boolean pingInBand() {
+            if (socket != null && activeOut != null && running) {
+                try {
+                    sendAt(activeOut, "+CIEV: 7, 5");
+                    return true;
+                } catch (Throwable t) {
+                    Log.d(TAG, "In-band ping failed: " + t.getMessage());
+                }
+            }
+            return false;
+        }
+
         void shutdown() {
             running = false;
+            activeOut = null;
             closeQuietly(socket);
             interrupt();
         }
@@ -348,6 +388,7 @@ public class TwsBatteryManager {
                     Log.i(TAG, "Connected HFP battery socket to " + device.getName());
                     reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "ASCII"), 256);
                     out = socket.getOutputStream();
+                    activeOut = out;
 
                     String line;
                     while (running && (line = reader.readLine()) != null) {
@@ -362,6 +403,7 @@ public class TwsBatteryManager {
                         sleepQuietly(1500);
                     }
                 } finally {
+                    activeOut = null;
                     closeQuietly(reader);
                     closeQuietly(out);
                     closeQuietly(socket);

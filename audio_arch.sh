@@ -22,7 +22,7 @@ SRC_DIR="${SCRIPT_DIR}/src"
 MODE="auto" # "auto", "bt", or "alsa"
 ACTIVE_BACKEND="alsa"
 BT_DEVICE_NAME=""
-DAEMON_VERSION="2.2"
+DAEMON_VERSION="2.3"
 REMOTE_VER_FILE="/data/local/tmp/audioarch_version"
 FORCE_DEPLOY=false
 FORCE_RESTART=false
@@ -584,7 +584,7 @@ ensure_daemon_running() {
 
 start_daemon() {
     adb shell "svc power stayon usb" &>/dev/null || true
-    adb shell "su -c 'pkill -f getevent; pkill -f logcat' 2>/dev/null || pkill -f getevent 2>/dev/null; pkill -f logcat 2>/dev/null || true"
+    adb shell "su -c 'killall -9 logcat 2>/dev/null; killall -9 getevent 2>/dev/null; pkill -f getevent 2>/dev/null; pkill -f logcat 2>/dev/null' 2>/dev/null || killall -9 logcat 2>/dev/null; killall -9 getevent 2>/dev/null || true"
 
     if [[ "$ACTIVE_BACKEND" == "bt" ]]; then
         info "Starting Bluetooth AudioReceiver daemon on phone..."
@@ -633,7 +633,7 @@ stop_daemon() {
     else
         ok "No audio daemon was running."
     fi
-    adb shell "su -c 'pkill -f getevent; pkill -f logcat' 2>/dev/null || pkill -f getevent 2>/dev/null; pkill -f logcat 2>/dev/null || true"
+    adb shell "su -c 'killall -9 logcat 2>/dev/null; killall -9 getevent 2>/dev/null; pkill -f getevent 2>/dev/null; pkill -f logcat 2>/dev/null' 2>/dev/null || killall -9 logcat 2>/dev/null; killall -9 getevent 2>/dev/null || true"
     adb forward --remove "tcp:${PORT}" 2>/dev/null || true
     adb forward --remove "tcp:${CTRL_PORT}" 2>/dev/null || true
 }

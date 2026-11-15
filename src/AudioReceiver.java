@@ -21,7 +21,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 public class AudioReceiver {
-    public static final String VERSION = "2.2";
+    public static final String VERSION = "2.3";
     private static final int DEFAULT_AUDIO_PORT = 12345;
     private static final int DEFAULT_CTRL_PORT = 12346;
     private static final int DEFAULT_SAMPLE_RATE = 44100;
@@ -60,11 +60,27 @@ public class AudioReceiver {
 
     public static synchronized void updateBatteryState(int batteryLevel, boolean isCharging, String details) {
         if (batteryLevel < 0 || batteryLevel > 100) return;
+
         lastKnownBtBattery = batteryLevel;
         lastChargingState = isCharging;
         btBatterySource = "live";
         btBatteryTime = new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date());
-        btBatteryDetails = (details != null && !details.isEmpty()) ? details : (isCharging ? "⚡" : (batteryLevel + "%"));
+
+        if (details != null && (details.contains("L:") || details.contains("R:") || details.contains("Case:"))) {
+            // High-fidelity multi-component vendor packet (e.g. from +XIAOMI)
+            btBatteryDetails = details;
+        } else if (btBatteryDetails != null && (btBatteryDetails.contains("L:") || btBatteryDetails.contains("R:"))) {
+            // Live update is a single-level reading (e.g. IPHONEACCEV 70%), but we previously had dual-bud state.
+            // Synchronize the dual-bud display to the live reading, and clear stale charging indicators.
+            if (isCharging) {
+                btBatteryDetails = "L:" + batteryLevel + "%⚡ R:" + batteryLevel + "%⚡";
+            } else {
+                btBatteryDetails = "L:" + batteryLevel + "% R:" + batteryLevel + "%";
+            }
+        } else {
+            btBatteryDetails = (details != null && !details.isEmpty()) ? details : (isCharging ? (batteryLevel + "%⚡") : (batteryLevel + "%"));
+        }
+
         System.out.printf("[TwsBattery] Live battery: %d%% (%s) from %s%n", batteryLevel, btBatteryDetails, lastKnownBtDevice);
         broadcast(String.format("BATTERY|%d|%s|live|%s|%s", batteryLevel, lastKnownBtDevice, btBatteryTime, btBatteryDetails));
     }
@@ -318,9 +334,11 @@ public class AudioReceiver {
                             if (!line.contains("processVendorSpecificAt")) continue;
                             BatteryInfo info = parseVendorAtLine(line);
                             if (info != null && info.battery >= 0) {
-                                String curDev = queryBluetoothDeviceName();
-                                if (curDev != null && !curDev.isEmpty() && !"null".equalsIgnoreCase(curDev)) {
-                                    lastKnownBtDevice = curDev;
+                                if (lastKnownBtDevice == null || "Disconnected".equalsIgnoreCase(lastKnownBtDevice)) {
+                                    String curDev = queryBluetoothDeviceName();
+                                    if (curDev != null && !curDev.isEmpty() && !"null".equalsIgnoreCase(curDev)) {
+                                        lastKnownBtDevice = curDev;
+                                    }
                                 }
                                 updateBatteryState(info.battery, info.isCharging, info.details);
                             }
@@ -352,12 +370,21 @@ public class AudioReceiver {
         lastKnownBtDevice = curDev;
         if (batteryManager != null) {
             batteryManager.attachToDeviceByName(curDev);
-            batteryManager.forceReconnect();
-            // Wait up to 1.5s for immediate live battery handshake from earbuds
-            for (int i = 0; i < 15; i++) {
-                try { Thread.sleep(100); } catch (Exception ignored) {}
-                if (batteryManager.getLastBatteryLevel() >= 0) {
-                    break;
+            // Try non-disruptive in-band indicator ping first
+            boolean pinged = batteryManager.pingInBand();
+            if (pinged) {
+                for (int i = 0; i < 8; i++) {
+                    try { Thread.sleep(100); } catch (Exception ignored) {}
+                }
+            }
+            if (batteryManager.getLastBatteryLevel() < 0) {
+                batteryManager.forceReconnect();
+                // Wait up to 1.5s for immediate live battery handshake from earbuds
+                for (int i = 0; i < 15; i++) {
+                    try { Thread.sleep(100); } catch (Exception ignored) {}
+                    if (batteryManager.getLastBatteryLevel() >= 0) {
+                        break;
+                    }
                 }
             }
         }

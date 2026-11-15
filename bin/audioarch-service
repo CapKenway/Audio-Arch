@@ -28,7 +28,7 @@ CTRL_PORT = 12346
 SAMPLE_RATE = 44100
 CHANNELS = 2
 SINK_NAME = "AudioArch-Sink"
-DAEMON_VERSION = "2.2"
+DAEMON_VERSION = "2.3"
 
 state = {
     "status": "waiting_for_device",
